@@ -10,7 +10,7 @@ import os
 import sys
 import time
 import argparse
-import threading
+import gc
 import tt_burnin
 from rich.live import Live
 from rich.text import Text
@@ -18,6 +18,11 @@ from rich.console import Group
 from importlib.resources import path
 from tt_burnin.chip import WhChip, RemoteWhChip, BhChip
 from tt_burnin.load_ttx import load_ttx_file, TtxFile, CoreId
+from tt_burnin.ramp import (
+    check_power_limits,
+    ordered_tensix_cores,
+    release_tensix_cores,
+)
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
 from tt_burnin.utils import (
     parse_reset_input,
@@ -28,7 +33,6 @@ from tt_burnin.utils import (
     generate_table,
     get_board_type,
     reset_6u_glx,
-
 )
 from tt_tools_common.utils_common.system_utils import (
     get_driver_version,
@@ -83,7 +87,10 @@ def start_burnin_wh(
     keep_trisc_under_reset: bool = False,
     stagger_start: bool = False,
     no_check: bool = False,
-    idle: bool = False
+    idle: bool = False,
+    ramp_step: int = 0,
+    max_cores: int | None = None,
+    after_batch=None,
 ):
     BRISC_SOFT_RESET = 1 << 11
     TRISC_SOFT_RESETS = (1 << 12) | (1 << 13) | (1 << 14)
@@ -101,12 +108,15 @@ def start_burnin_wh(
     # Go busy
     device.arc_msg(0x52)
 
+    all_cores = {CoreId(*core) for core in device.get_tensix_locations()}
+    selected_cores = ordered_tensix_cores(all_cores, max_cores)
+
     if not idle:
         with path("tt_burnin", "") as data_path:
             load_ttx_file(
                 device,
                 TtxFile(str(data_path.joinpath("ttx/whpv.ttx"))),
-                {CoreId(0, 0): device.get_tensix_locations()},
+                {CoreId(0, 0): set(selected_cores)},
                 no_check,
             )
 
@@ -117,8 +127,19 @@ def start_burnin_wh(
     else:
         soft_reset_value = NCRISC_SOFT_RESET | STAGGERED_START_ENABLE
 
-    # Take cores out of reset
-    device.noc_broadcast32(0, 0xFFB121B0, soft_reset_value)
+    # Preserve the legacy broadcast for API callers that do not request staging.
+    if ramp_step == 0 and len(selected_cores) == len(all_cores):
+        device.noc_broadcast32(0, 0xFFB121B0, soft_reset_value)
+        if after_batch is not None:
+            after_batch(len(selected_cores), len(selected_cores))
+    else:
+        release_tensix_cores(
+            device,
+            selected_cores,
+            soft_reset_value,
+            ramp_step,
+            after_batch,
+        )
 
 
 def stop_burnin_wh(device):
@@ -140,7 +161,10 @@ def start_burnin_bh(
     keep_trisc_under_reset: bool = False,
     stagger_start: bool = False,
     no_check: bool = False,
-    idle: bool = False
+    idle: bool = False,
+    ramp_step: int = 0,
+    max_cores: int | None = None,
+    after_batch=None,
 ):
     BRISC_SOFT_RESET = 1 << 11
     TRISC_SOFT_RESETS = (1 << 12) | (1 << 13) | (1 << 14)
@@ -158,13 +182,16 @@ def start_burnin_bh(
         # GO_BUSY message (power management interface prior to KMD v2.6.0, FW v18.12.0)
         device.arc_msg(0x52)
 
+    all_cores = {CoreId(*core) for core in device.get_tensix_locations()}
+    selected_cores = ordered_tensix_cores(all_cores, max_cores)
+
     if not idle:
         with path("tt_burnin", "") as data_path:
             load_ttx_file(
                 device,
                 TtxFile(str(data_path.joinpath("ttx/bhpv.ttx"))),
-                {CoreId(0, 0): device.get_tensix_locations()},
-                no_check
+                {CoreId(0, 0): set(selected_cores)},
+                no_check,
             )
 
     if keep_trisc_under_reset:
@@ -174,8 +201,19 @@ def start_burnin_bh(
     else:
         soft_reset_value = NCRISC_SOFT_RESET | STAGGERED_START_ENABLE
 
-    # Take cores out of reset
-    device.noc_broadcast32(0, 0xFFB121B0, soft_reset_value)
+    # Preserve the legacy broadcast for API callers that do not request staging.
+    if ramp_step == 0 and len(selected_cores) == len(all_cores):
+        device.noc_broadcast32(0, 0xFFB121B0, soft_reset_value)
+        if after_batch is not None:
+            after_batch(len(selected_cores), len(selected_cores))
+    else:
+        release_tensix_cores(
+            device,
+            selected_cores,
+            soft_reset_value,
+            ramp_step,
+            after_batch,
+        )
 
 
 def stop_burnin_bh(device):
@@ -192,6 +230,34 @@ def stop_burnin_bh(device):
     device.noc_broadcast32(
         0, 0xFFB121B0, BRISC_SOFT_RESET | TRISC_SOFT_RESETS | NCRISC_SOFT_RESET
     )
+
+
+def positive_int(value):
+    value = int(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return value
+
+
+def non_negative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return value
+
+
+def positive_float(value):
+    value = float(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return value
+
+
+def non_negative_float(value):
+    value = float(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return value
 
 
 def parse_args():
@@ -232,8 +298,60 @@ def parse_args():
         default=False,
         help="Don't load the power virus workload, just run the tensix idle",
     )
+    parser.add_argument(
+        "--ramp-step",
+        type=non_negative_int,
+        default=1,
+        metavar="CORES",
+        help=(
+            "Release this many Tensix cores per ramp step (default: 1). "
+            "Use 0 for the legacy simultaneous start."
+        ),
+    )
+    parser.add_argument(
+        "--ramp-interval",
+        type=non_negative_float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Wait this long after each ramp step (default: 1.0)",
+    )
+    parser.add_argument(
+        "--max-cores",
+        type=positive_int,
+        default=None,
+        metavar="CORES",
+        help="Run on at most this many Tensix cores per device",
+    )
+    parser.add_argument(
+        "--duration",
+        type=positive_float,
+        default=None,
+        metavar="SECONDS",
+        help="Stop automatically this long after the ramp completes",
+    )
+    parser.add_argument(
+        "--max-board-power",
+        type=positive_float,
+        default=None,
+        metavar="WATTS",
+        help=(
+            "Stop if any local board reaches this measured input power. "
+            "This is a reactive cutoff, not a hard electrical limit."
+        ),
+    )
+    parser.add_argument(
+        "--max-total-board-power",
+        type=positive_float,
+        default=None,
+        metavar="WATTS",
+        help=(
+            "Stop if the measured input power summed across local boards "
+            "reaches this value"
+        ),
+    )
     # subparsers = parser.add_subparsers(title="command", dest="command", required=True)
     return parser.parse_args()
+
 
 def detect_and_group_devices():
     all_devices = detect_chips_with_callback()
@@ -251,27 +369,50 @@ def detect_and_group_devices():
             raise ValueError("Did not recognize board")
         devices.append(device)
 
-    driver = get_driver_version()
-    if is_driver_version_at_least(driver, "2.6.0"):
-        # Raise power state to high (BH)
-        for device in devices:
-            try:
-                device.set_power_state("high")
-            except:
-                print(
-                    CMD_LINE_COLOR.RED,
-                    "Failed to set power state. Your firmware version might be too old.",
-                    "Please update firmware to v18.12.0 or newer.",
-                    "Or, if you know it's already up-to-date, please try power cycling.",
-                    CMD_LINE_COLOR.ENDC,
-                )
-                sys.exit(1)
-
     return devs, devices
 
-def garbage_collect_all_devices(all_devices):
-    for device in all_devices:
-        del device
+
+def set_device_power_state(device, state):
+    try:
+        device.set_power_state(state)
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to set device power state to {state}. Firmware v18.12.0 "
+            "or newer is required; otherwise try power cycling the host."
+        ) from error
+
+
+def local_devices(devices):
+    return [device for device in devices if not device.is_remote()]
+
+
+class BurninStopped(Exception):
+    """Internal signal used when the operator stops during the startup ramp."""
+
+
+def wait_with_power_checks(
+    devices,
+    seconds,
+    max_board_power=None,
+    max_total_board_power=None,
+    check_stdin=False,
+):
+    deadline = time.monotonic() + seconds
+    while True:
+        check_power_limits(devices, max_board_power, max_total_board_power)
+        if check_stdin and len(sys.stdin.read(1)) > 0:
+            raise BurninStopped
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
+def garbage_collect_all_devices(*device_groups):
+    for devices in device_groups:
+        devices.clear()
+    gc.collect()
+
 
 def main():
     args = parse_args()
@@ -285,55 +426,104 @@ def main():
         reset_all_devices(devices, reset_filename=args.reset)
 
     # Force garbage collection on the old devices and start with new device objects after reset
-    garbage_collect_all_devices(devices)
+    garbage_collect_all_devices(devs, devices)
     devs, devices = detect_and_group_devices()
+    telemetry_devices = local_devices(devices)
+    driver = get_driver_version()
+    kmd_power_management = is_driver_version_at_least(driver, "2.6.0")
     try:
         print()
         print(
             CMD_LINE_COLOR.BLUE,
-            "Starting TT-Burnin workload on all boards. WARNING: Opening SMI might cause unexpected behavior",
+            "Starting TT-Burnin workload on all boards with staged core activation.",
             CMD_LINE_COLOR.ENDC,
         )
         print()
-        def start_burnin(device, idx, total):
+
+        def start_burnin(device, raw_device, idx, total):
+            print(
+                CMD_LINE_COLOR.PURPLE,
+                f"Starting TT-Burnin workload on device {idx + 1}/{total}",
+                CMD_LINE_COLOR.ENDC,
+            )
+
+            # Power devices and start their cores one at a time. The old path raised
+            # every device to high power during both detection passes, then started
+            # all chips concurrently.
+            if kmd_power_management:
+                set_device_power_state(raw_device, "high")
+                wait_with_power_checks(
+                    telemetry_devices,
+                    args.ramp_interval,
+                    args.max_board_power,
+                    args.max_total_board_power,
+                    check_stdin=True,
+                )
+
+            def after_batch(released, total_cores):
                 print(
                     CMD_LINE_COLOR.PURPLE,
-                    f"Starting TT-Burnin workload on device {idx + 1}/{total}",
+                    f"Device {idx + 1}: active Tensix cores {released}/{total_cores}",
                     CMD_LINE_COLOR.ENDC,
                 )
-                if isinstance(device, WhChip):
-                    start_burnin_wh(device)
-                elif isinstance(device, BhChip):
-                    start_burnin_bh(device)
-                else:
-                    raise NotImplementedError(f"Don't support {device}")
+                wait_with_power_checks(
+                    telemetry_devices,
+                    args.ramp_interval,
+                    args.max_board_power,
+                    args.max_total_board_power,
+                    check_stdin=True,
+                )
 
-        # Thread the start of burnin for faster speed
-        threads = []
-        for i, device in enumerate(devs):
-            t = threading.Thread(target=start_burnin, args=(device, i, len(devs)))
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
+            kwargs = {
+                "no_check": args.no_check,
+                "idle": args.idle,
+                "ramp_step": args.ramp_step,
+                "max_cores": args.max_cores,
+                "after_batch": after_batch,
+            }
+            if isinstance(device, WhChip):
+                start_burnin_wh(device, **kwargs)
+            elif isinstance(device, BhChip):
+                start_burnin_bh(device, **kwargs)
+            else:
+                raise NotImplementedError(f"Don't support {device}")
+
+        # Sequential startup prevents ramps on multiple boards from overlapping.
+        for i, (device, raw_device) in enumerate(zip(devs, devices)):
+            start_burnin(device, raw_device, i, len(devs))
 
         text = Text(
             " Press Enter to STOP TT-Burnin on all boards...", style="bold yellow"
         )
 
         # Create a live update for telemetry widget
+        burnin_started = time.monotonic()
         with Live(Group(generate_table(devices), text), refresh_per_second=10) as live:
             while True:
                 # Break if there is any user keypress
                 c = sys.stdin.read(1)
                 if len(c) > 0:
                     break
+                if (
+                    args.duration is not None
+                    and time.monotonic() - burnin_started >= args.duration
+                ):
+                    break
+                check_power_limits(
+                    telemetry_devices,
+                    args.max_board_power,
+                    args.max_total_board_power,
+                )
                 live.update(Group(generate_table(devices), text))
                 time.sleep(0.1)
-    except Exception as e:
+    except BurninStopped:
+        pass
+    except Exception as error:
         import traceback
+
         traceback.print_exc()
-        print(e)
+        print(error)
+        raise
     finally:
         print()
         print(
@@ -342,7 +532,7 @@ def main():
             CMD_LINE_COLOR.ENDC,
         )
         print()
-        # Thread the stop of burnin for faster speed
+
         def stop_burnin(device):
             if isinstance(device, WhChip):
                 stop_burnin_wh(device)
@@ -351,17 +541,31 @@ def main():
             else:
                 raise NotImplementedError(f"Don't support {device}")
 
-        stop_threads = []
+        # Stop sequentially too, and continue cleanup if one device is unhealthy.
         for device in devs:
-            t = threading.Thread(target=stop_burnin, args=(device,))
-            t.start()
-            stop_threads.append(t)
-        for t in stop_threads:
-            t.join()
+            try:
+                stop_burnin(device)
+            except Exception as error:
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Failed to stop {device}: {error}",
+                    CMD_LINE_COLOR.ENDC,
+                )
+
+        if kmd_power_management:
+            for device in devices:
+                try:
+                    set_device_power_state(device, "low")
+                except Exception as error:
+                    print(
+                        CMD_LINE_COLOR.RED,
+                        str(error),
+                        CMD_LINE_COLOR.ENDC,
+                    )
 
         # Final reset to restore state
         if not args.no_reset:
             reset_all_devices(devices, reset_filename=args.reset)
 
-        # Force garbage collection on the old devices and start with new device objects after reset
-        garbage_collect_all_devices(devices)
+        # Drop all KMD clients so their power-management references are released.
+        garbage_collect_all_devices(devs, devices)
