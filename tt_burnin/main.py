@@ -342,6 +342,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--tdp-limit",
+        type=positive_int,
+        default=None,
+        metavar="WATTS",
+        help=(
+            "Set a temporary Blackhole ASIC TDP limit. The firmware validates "
+            "the device-specific value and TT-Burnin restores the previous "
+            "runtime limit on exit."
+        ),
+    )
+    parser.add_argument(
         "--enable-gddr",
         action="store_true",
         help=(
@@ -462,6 +473,16 @@ def set_host_aiclk_limit(device, frequency_mhz=None):
         )
 
 
+def set_tdp_limit(device, watts):
+    """Set Blackhole's runtime ASIC TDP limit."""
+    blackhole = device.as_bh()
+    if blackhole is None:
+        raise RuntimeError("--tdp-limit is only supported on Blackhole")
+    response = blackhole.arc_msg_buf([0x22, watts, 0, 0, 0, 0, 0, 0])
+    if response[0] != 0:
+        raise RuntimeError(f"Blackhole firmware rejected the {watts} W ASIC TDP limit")
+
+
 def local_devices(devices):
     return [device for device in devices if not device.is_remote()]
 
@@ -525,6 +546,7 @@ def main():
     dwell_power_maxs = [0.0] * len(telemetry_devices)
     dwell_sample_count = 0
     limited_aiclk_devices = []
+    changed_tdp_devices = []
     driver = get_driver_version()
     kmd_power_management = is_driver_version_at_least(driver, "2.6.0")
     try:
@@ -547,6 +569,10 @@ def main():
             # every device to high power during both detection passes, then started
             # all chips concurrently.
             if kmd_power_management:
+                if args.tdp_limit is not None and raw_device.as_bh() is not None:
+                    previous_tdp_limit = raw_device.get_telemetry().tdp_limit_max
+                    set_tdp_limit(raw_device, args.tdp_limit)
+                    changed_tdp_devices.append((raw_device, previous_tdp_limit))
                 if args.aiclk_limit is not None and raw_device.as_bh() is not None:
                     set_host_aiclk_limit(raw_device, args.aiclk_limit)
                     limited_aiclk_devices.append(raw_device)
@@ -710,6 +736,16 @@ def main():
                 print(
                     CMD_LINE_COLOR.RED,
                     f"Failed to restore host AICLK limit: {error}",
+                    CMD_LINE_COLOR.ENDC,
+                )
+
+        for device, previous_tdp_limit in changed_tdp_devices:
+            try:
+                set_tdp_limit(device, previous_tdp_limit)
+            except Exception as error:
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Failed to restore {previous_tdp_limit} W TDP limit: {error}",
                     CMD_LINE_COLOR.ENDC,
                 )
 

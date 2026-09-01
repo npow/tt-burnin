@@ -41,7 +41,7 @@ Command line arguments
 usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
                  [--no-check] [--idle] [--ramp-step CORES]
                  [--ramp-interval SECONDS] [--max-cores CORES]
-                 [--duration SECONDS] [--aiclk-limit MHZ]
+                 [--duration SECONDS] [--aiclk-limit MHZ] [--tdp-limit WATTS]
                  [--enable-gddr] [--enable-l2cpu]
                  [--max-board-power WATTS]
                  [--max-total-board-power WATTS]
@@ -55,7 +55,7 @@ Running tt-burnin with the ```-h, --help``` flag should bring up something that 
 usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
                  [--no-check] [--idle] [--ramp-step CORES]
                  [--ramp-interval SECONDS] [--max-cores CORES]
-                 [--duration SECONDS] [--aiclk-limit MHZ]
+                 [--duration SECONDS] [--aiclk-limit MHZ] [--tdp-limit WATTS]
                  [--enable-gddr] [--enable-l2cpu]
                  [--max-board-power WATTS]
                  [--max-total-board-power WATTS]
@@ -73,6 +73,7 @@ optional arguments:
   --max-cores CORES     Run on at most this many Tensix cores per device
   --duration SECONDS    Stop automatically this long after the ramp completes
   --aiclk-limit MHZ     Temporarily limit Blackhole AICLK; restored on exit
+  --tdp-limit WATTS     Temporarily set Blackhole ASIC TDP; restored on exit
   --enable-gddr         Wake Blackhole GDDR after the core ramp
   --enable-l2cpu        Enable Blackhole L2CPU clocks after the core ramp
   --max-board-power WATTS
@@ -110,6 +111,10 @@ device-validated host ceiling and restores the default during cleanup:
 ```
 tt-burnin --aiclk-limit 900 --max-cores 1 --duration 3
 ```
+
+`--tdp-limit` similarly applies a temporary firmware-validated ASIC limit and
+restores the previous runtime value during cleanup. It is a reactive control and
+does not prevent short power excursions.
 
 For board-power testing beyond the BHPV workload itself, `--enable-gddr` and
 `--enable-l2cpu` add those otherwise-unused domains only after every selected

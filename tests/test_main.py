@@ -11,6 +11,7 @@ from tt_burnin.main import (
     parse_args,
     set_burnin_power_state,
     set_host_aiclk_limit,
+    set_tdp_limit,
     start_burnin_bh,
     wait_with_power_checks,
 )
@@ -92,6 +93,11 @@ class MainTests(unittest.TestCase):
                 [0x23, 0, 1, 0, 0, 0, 0, 0],
             ],
         )
+
+    def test_tdp_limit_uses_blackhole_runtime_message(self):
+        device = FakeRawBlackhole()
+        set_tdp_limit(device, 75)
+        self.assertEqual(device.messages, [[0x22, 75, 0, 0, 0, 0, 0, 0]])
 
     @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
     @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
