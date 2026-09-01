@@ -130,6 +130,9 @@ short transient or substitute for adequate board and host power delivery. Use
 Pressing Enter also stops immediately between ramp samples; it is not deferred
 until every core has started.
 
+At exit, TT-Burnin reports both the peak sampled board input power across startup
+and the average/range sampled during the sustained post-ramp dwell.
+
 A full run of burnin should look like - 
 
 ```

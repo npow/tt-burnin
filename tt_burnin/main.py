@@ -520,6 +520,10 @@ def main():
     devs, devices = detect_and_group_devices()
     telemetry_devices = local_devices(devices)
     power_peaks = [0.0] * len(telemetry_devices)
+    dwell_power_sums = [0.0] * len(telemetry_devices)
+    dwell_power_mins = [float("inf")] * len(telemetry_devices)
+    dwell_power_maxs = [0.0] * len(telemetry_devices)
+    dwell_sample_count = 0
     limited_aiclk_devices = []
     driver = get_driver_version()
     kmd_power_management = is_driver_version_at_least(driver, "2.6.0")
@@ -644,8 +648,12 @@ def main():
                     for index, power in enumerate(error.powers):
                         power_peaks[index] = max(power_peaks[index], power)
                     raise
+                dwell_sample_count += 1
                 for index, power in enumerate(powers):
                     power_peaks[index] = max(power_peaks[index], power)
+                    dwell_power_sums[index] += power
+                    dwell_power_mins[index] = min(dwell_power_mins[index], power)
+                    dwell_power_maxs[index] = max(dwell_power_maxs[index], power)
                 live.update(Group(generate_table(devices), text))
                 time.sleep(0.1)
     except BurninStopped:
@@ -712,6 +720,22 @@ def main():
                 + ", ".join(
                     f"device {index}: {power:.1f} W"
                     for index, power in enumerate(power_peaks)
+                ),
+                CMD_LINE_COLOR.ENDC,
+            )
+        if dwell_sample_count:
+            print(
+                CMD_LINE_COLOR.PURPLE,
+                "Sustained dwell board input power: "
+                + ", ".join(
+                    (
+                        f"device {index}: avg "
+                        f"{dwell_power_sums[index] / dwell_sample_count:.1f} W, "
+                        f"range {dwell_power_mins[index]:.1f}-"
+                        f"{dwell_power_maxs[index]:.1f} W "
+                        f"({dwell_sample_count} samples)"
+                    )
+                    for index in range(len(dwell_power_sums))
                 ),
                 CMD_LINE_COLOR.ENDC,
             )
