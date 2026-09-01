@@ -70,8 +70,9 @@ class RampTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             BoardPowerLimitExceeded, "Device 1 reached 150.0 W"
-        ):
+        ) as raised:
             check_power_limits([FakeDevice(80), FakeDevice(150)], 150)
+        self.assertEqual(raised.exception.powers, [80.0, 150.0])
 
     def test_total_power_limit_checks_the_host_sum(self):
         with self.assertRaisesRegex(

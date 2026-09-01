@@ -19,6 +19,7 @@ from importlib.resources import path
 from tt_burnin.chip import WhChip, RemoteWhChip, BhChip
 from tt_burnin.load_ttx import load_ttx_file, TtxFile, CoreId
 from tt_burnin.ramp import (
+    BoardPowerLimitExceeded,
     check_power_limits,
     ordered_tensix_cores,
     release_tensix_cores,
@@ -330,6 +331,17 @@ def parse_args():
         help="Stop automatically this long after the ramp completes",
     )
     parser.add_argument(
+        "--aiclk-limit",
+        type=positive_int,
+        default=None,
+        metavar="MHZ",
+        help=(
+            "Set a temporary Blackhole host AICLK ceiling. The firmware "
+            "validates the device-specific value and TT-Burnin restores the "
+            "default on exit."
+        ),
+    )
+    parser.add_argument(
         "--max-board-power",
         type=positive_float,
         default=None,
@@ -382,6 +394,58 @@ def set_device_power_state(device, state):
         ) from error
 
 
+def set_burnin_power_state(device):
+    """Enable only the power domains required by the burnin workload."""
+    try:
+        if device.as_bh() is not None:
+            # BHPV runs entirely on Tensix using local L1/NOC traffic. Waking
+            # GDDR/MRISC and L2CPU adds a large board-power step without helping
+            # the workload.
+            device.set_power(
+                aiclk=True,
+                mrisc=False,
+                tensix=True,
+                l2cpu=False,
+                pcie=True,
+            )
+        else:
+            device.set_power_state("high")
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to enable the device power domains needed by TT-Burnin. "
+            "Firmware v18.12.0 or newer is required; otherwise try power "
+            "cycling the host."
+        ) from error
+
+
+def set_host_aiclk_limit(device, frequency_mhz=None):
+    """Set or restore Blackhole's temporary host AICLK ceiling."""
+    blackhole = device.as_bh()
+    if blackhole is None:
+        raise RuntimeError("--aiclk-limit is only supported on Blackhole")
+
+    restore_default = frequency_mhz is None
+    response = blackhole.arc_msg_buf(
+        [
+            0x23,
+            0 if restore_default else frequency_mhz,
+            1 if restore_default else 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+    )
+    if response[0] != 0:
+        operation = (
+            "restore the default" if restore_default else f"set {frequency_mhz} MHz"
+        )
+        raise RuntimeError(
+            f"Blackhole firmware rejected the request to {operation} host AICLK limit"
+        )
+
+
 def local_devices(devices):
     return [device for device in devices if not device.is_remote()]
 
@@ -396,10 +460,20 @@ def wait_with_power_checks(
     max_board_power=None,
     max_total_board_power=None,
     check_stdin=False,
+    power_peaks=None,
 ):
     deadline = time.monotonic() + seconds
     while True:
-        check_power_limits(devices, max_board_power, max_total_board_power)
+        try:
+            powers = check_power_limits(devices, max_board_power, max_total_board_power)
+        except BoardPowerLimitExceeded as error:
+            if power_peaks is not None:
+                for index, power in enumerate(error.powers):
+                    power_peaks[index] = max(power_peaks[index], power)
+            raise
+        if power_peaks is not None:
+            for index, power in enumerate(powers):
+                power_peaks[index] = max(power_peaks[index], power)
         if check_stdin and len(sys.stdin.read(1)) > 0:
             raise BurninStopped
         remaining = deadline - time.monotonic()
@@ -429,6 +503,8 @@ def main():
     garbage_collect_all_devices(devs, devices)
     devs, devices = detect_and_group_devices()
     telemetry_devices = local_devices(devices)
+    power_peaks = [0.0] * len(telemetry_devices)
+    limited_aiclk_devices = []
     driver = get_driver_version()
     kmd_power_management = is_driver_version_at_least(driver, "2.6.0")
     try:
@@ -451,13 +527,17 @@ def main():
             # every device to high power during both detection passes, then started
             # all chips concurrently.
             if kmd_power_management:
-                set_device_power_state(raw_device, "high")
+                if args.aiclk_limit is not None and raw_device.as_bh() is not None:
+                    set_host_aiclk_limit(raw_device, args.aiclk_limit)
+                    limited_aiclk_devices.append(raw_device)
+                set_burnin_power_state(raw_device)
                 wait_with_power_checks(
                     telemetry_devices,
                     args.ramp_interval,
                     args.max_board_power,
                     args.max_total_board_power,
                     check_stdin=True,
+                    power_peaks=power_peaks,
                 )
 
             def after_batch(released, total_cores):
@@ -472,6 +552,7 @@ def main():
                     args.max_board_power,
                     args.max_total_board_power,
                     check_stdin=True,
+                    power_peaks=power_peaks,
                 )
 
             kwargs = {
@@ -509,11 +590,18 @@ def main():
                     and time.monotonic() - burnin_started >= args.duration
                 ):
                     break
-                check_power_limits(
-                    telemetry_devices,
-                    args.max_board_power,
-                    args.max_total_board_power,
-                )
+                try:
+                    powers = check_power_limits(
+                        telemetry_devices,
+                        args.max_board_power,
+                        args.max_total_board_power,
+                    )
+                except BoardPowerLimitExceeded as error:
+                    for index, power in enumerate(error.powers):
+                        power_peaks[index] = max(power_peaks[index], power)
+                    raise
+                for index, power in enumerate(powers):
+                    power_peaks[index] = max(power_peaks[index], power)
                 live.update(Group(generate_table(devices), text))
                 time.sleep(0.1)
     except BurninStopped:
@@ -562,6 +650,27 @@ def main():
                         str(error),
                         CMD_LINE_COLOR.ENDC,
                     )
+
+        for device in limited_aiclk_devices:
+            try:
+                set_host_aiclk_limit(device)
+            except Exception as error:
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Failed to restore host AICLK limit: {error}",
+                    CMD_LINE_COLOR.ENDC,
+                )
+
+        if power_peaks:
+            print(
+                CMD_LINE_COLOR.PURPLE,
+                "Peak sampled board input power: "
+                + ", ".join(
+                    f"device {index}: {power:.1f} W"
+                    for index, power in enumerate(power_peaks)
+                ),
+                CMD_LINE_COLOR.ENDC,
+            )
 
         # Final reset to restore state
         if not args.no_reset:

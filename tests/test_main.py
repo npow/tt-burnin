@@ -9,6 +9,8 @@ from tt_burnin.load_ttx import CoreId
 from tt_burnin.main import (
     BurninStopped,
     parse_args,
+    set_burnin_power_state,
+    set_host_aiclk_limit,
     start_burnin_bh,
     wait_with_power_checks,
 )
@@ -33,6 +35,22 @@ class FakeChip:
         self.messages.append(message)
 
 
+class FakeRawBlackhole:
+    def __init__(self):
+        self.power = None
+        self.messages = []
+
+    def as_bh(self):
+        return self
+
+    def set_power(self, **kwargs):
+        self.power = kwargs
+
+    def arc_msg_buf(self, message):
+        self.messages.append(message)
+        return [0] * 8
+
+
 class MainTests(unittest.TestCase):
     def test_cli_defaults_to_one_core_per_second(self):
         with patch.object(sys, "argv", ["tt-burnin"]):
@@ -45,6 +63,32 @@ class MainTests(unittest.TestCase):
         with patch("tt_burnin.main.sys.stdin.read", return_value="\n"):
             with self.assertRaises(BurninStopped):
                 wait_with_power_checks([], 10, check_stdin=True)
+
+    def test_blackhole_power_profile_leaves_unused_domains_off(self):
+        device = FakeRawBlackhole()
+        set_burnin_power_state(device)
+        self.assertEqual(
+            device.power,
+            {
+                "aiclk": True,
+                "mrisc": False,
+                "tensix": True,
+                "l2cpu": False,
+                "pcie": True,
+            },
+        )
+
+    def test_host_aiclk_limit_is_set_and_restored(self):
+        device = FakeRawBlackhole()
+        set_host_aiclk_limit(device, 900)
+        set_host_aiclk_limit(device)
+        self.assertEqual(
+            device.messages,
+            [
+                [0x23, 900, 0, 0, 0, 0, 0, 0],
+                [0x23, 0, 1, 0, 0, 0, 0, 0],
+            ],
+        )
 
     @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
     @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")

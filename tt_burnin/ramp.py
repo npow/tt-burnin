@@ -13,6 +13,10 @@ Core = TypeVar("Core", bound=tuple[int, int])
 class BoardPowerLimitExceeded(RuntimeError):
     """Raised when a board reaches the user-provided input-power cutoff."""
 
+    def __init__(self, message: str, powers: list[float]):
+        super().__init__(message)
+        self.powers = powers
+
 
 def ordered_tensix_cores(
     cores: Iterable[Core], max_cores: int | None = None
@@ -58,9 +62,6 @@ def check_power_limits(
     max_total_board_power: float | None = None,
 ) -> list[float]:
     """Read fresh telemetry and fail when a user-provided cutoff is reached."""
-    if max_board_power is None and max_total_board_power is None:
-        return []
-
     powers = []
     for index, device in enumerate(devices):
         telemetry = device.get_telemetry()
@@ -69,18 +70,21 @@ def check_power_limits(
                 f"Device {index} does not expose input-power telemetry; "
                 "cannot enforce --max-board-power"
             )
-        power = float(telemetry.input_power)
-        powers.append(power)
+        powers.append(float(telemetry.input_power))
+
+    for index, power in enumerate(powers):
         if max_board_power is not None and power >= max_board_power:
             raise BoardPowerLimitExceeded(
                 f"Device {index} reached {power:.1f} W board input power "
-                f"(cutoff: {max_board_power:.1f} W)"
+                f"(cutoff: {max_board_power:.1f} W)",
+                powers,
             )
 
     total_power = sum(powers)
     if max_total_board_power is not None and total_power >= max_total_board_power:
         raise BoardPowerLimitExceeded(
             f"Detected boards reached {total_power:.1f} W total input power "
-            f"(cutoff: {max_total_board_power:.1f} W)"
+            f"(cutoff: {max_total_board_power:.1f} W)",
+            powers,
         )
     return powers
