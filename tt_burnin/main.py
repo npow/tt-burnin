@@ -342,6 +342,22 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--enable-gddr",
+        action="store_true",
+        help=(
+            "Wake Blackhole GDDR/MRISC after the core ramp. BHPV does not use "
+            "GDDR; this option adds board-power coverage."
+        ),
+    )
+    parser.add_argument(
+        "--enable-l2cpu",
+        action="store_true",
+        help=(
+            "Enable Blackhole L2CPU clocks after the core ramp. BHPV does not "
+            "use L2CPU; this option adds board-power coverage."
+        ),
+    )
+    parser.add_argument(
         "--max-board-power",
         type=positive_float,
         default=None,
@@ -394,7 +410,7 @@ def set_device_power_state(device, state):
         ) from error
 
 
-def set_burnin_power_state(device):
+def set_burnin_power_state(device, mrisc=False, l2cpu=False):
     """Enable only the power domains required by the burnin workload."""
     try:
         if device.as_bh() is not None:
@@ -403,9 +419,9 @@ def set_burnin_power_state(device):
             # the workload.
             device.set_power(
                 aiclk=True,
-                mrisc=False,
+                mrisc=mrisc,
                 tensix=True,
-                l2cpu=False,
+                l2cpu=l2cpu,
                 pcie=True,
             )
         else:
@@ -566,6 +582,34 @@ def main():
                 start_burnin_wh(device, **kwargs)
             elif isinstance(device, BhChip):
                 start_burnin_bh(device, **kwargs)
+
+                # The workload does not require these domains. If explicitly
+                # requested for board-power coverage, add them only after the
+                # Tensix ramp so their power step cannot overlap core startup.
+                if args.enable_l2cpu:
+                    set_burnin_power_state(raw_device, l2cpu=True)
+                    wait_with_power_checks(
+                        telemetry_devices,
+                        args.ramp_interval,
+                        args.max_board_power,
+                        args.max_total_board_power,
+                        check_stdin=True,
+                        power_peaks=power_peaks,
+                    )
+                if args.enable_gddr:
+                    set_burnin_power_state(
+                        raw_device,
+                        mrisc=True,
+                        l2cpu=args.enable_l2cpu,
+                    )
+                    wait_with_power_checks(
+                        telemetry_devices,
+                        args.ramp_interval,
+                        args.max_board_power,
+                        args.max_total_board_power,
+                        check_stdin=True,
+                        power_peaks=power_peaks,
+                    )
             else:
                 raise NotImplementedError(f"Don't support {device}")
 

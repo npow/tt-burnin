@@ -42,6 +42,7 @@ usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
                  [--no-check] [--idle] [--ramp-step CORES]
                  [--ramp-interval SECONDS] [--max-cores CORES]
                  [--duration SECONDS] [--aiclk-limit MHZ]
+                 [--enable-gddr] [--enable-l2cpu]
                  [--max-board-power WATTS]
                  [--max-total-board-power WATTS]
 ```
@@ -55,6 +56,7 @@ usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
                  [--no-check] [--idle] [--ramp-step CORES]
                  [--ramp-interval SECONDS] [--max-cores CORES]
                  [--duration SECONDS] [--aiclk-limit MHZ]
+                 [--enable-gddr] [--enable-l2cpu]
                  [--max-board-power WATTS]
                  [--max-total-board-power WATTS]
 
@@ -71,6 +73,8 @@ optional arguments:
   --max-cores CORES     Run on at most this many Tensix cores per device
   --duration SECONDS    Stop automatically this long after the ramp completes
   --aiclk-limit MHZ     Temporarily limit Blackhole AICLK; restored on exit
+  --enable-gddr         Wake Blackhole GDDR after the core ramp
+  --enable-l2cpu        Enable Blackhole L2CPU clocks after the core ramp
   --max-board-power WATTS
                         Stop if any local board reaches this measured input power
   --max-total-board-power WATTS
@@ -106,6 +110,10 @@ device-validated host ceiling and restores the default during cleanup:
 ```
 tt-burnin --aiclk-limit 900 --max-cores 1 --duration 3
 ```
+
+For board-power testing beyond the BHPV workload itself, `--enable-gddr` and
+`--enable-l2cpu` add those otherwise-unused domains only after every selected
+Tensix core has completed its staged start.
 
 The optional telemetry cutoffs take values chosen for the actual cards and host,
 so TT-Burnin does not invent a universal wattage limit:
