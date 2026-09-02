@@ -17,7 +17,7 @@ from rich.text import Text
 from rich.console import Group
 from importlib.resources import path
 from tt_burnin.chip import WhChip, RemoteWhChip, BhChip
-from tt_burnin.load_ttx import load_ttx_file, TtxFile, CoreId
+from tt_burnin.load_ttx import load_ttx_file, read_bin_image_chunks, TtxFile, CoreId
 from tt_burnin.ramp import (
     BoardPowerLimitExceeded,
     check_power_limits,
@@ -216,8 +216,33 @@ def start_burnin_bh(
             after_batch,
         )
 
+    return set(selected_cores)
 
-def stop_burnin_bh(device):
+
+def scrub_burnin_bh(device, loaded_cores):
+    """Erase and verify the packaged BHPV image while all RISCs are reset."""
+    with path("tt_burnin", "") as data_path:
+        with TtxFile(str(data_path.joinpath("ttx/bhpv.ttx"))) as ttx:
+            for image_name in ("0-0/image.bin", "0-0/ckernels.bin"):
+                for address, data in read_bin_image_chunks(ttx.open(image_name)):
+                    cleared = bytes(len(data))
+                    device.noc_broadcast(0, address, cleared)
+                    for core in sorted(loaded_cores):
+                        # Check both ends of every cleared region on every
+                        # functional core. A zeroed entry point prevents the
+                        # retained image from executing; checking the tail also
+                        # catches truncated broadcast writes.
+                        for offset in (0, len(data) - 4):
+                            observed = bytearray(4)
+                            device.noc_read(0, *core, address + offset, observed)
+                            if observed != bytes(4):
+                                raise RuntimeError(
+                                    f"Failed to scrub BHPV from core {core} "
+                                    f"at 0x{address + offset:x}"
+                                )
+
+
+def stop_burnin_bh(device, loaded_cores=None):
     """Stop BHPV and clear all state that could restart the workload.
 
     Merely asserting the per-RISC soft-reset register is insufficient for an
@@ -233,6 +258,12 @@ def stop_burnin_bh(device):
     SOFT_RESET_ADDR = 0xFFB121B0
     SOFT_RESET_DATA = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18)
 
+    def checked_arc_msg(message, operation, **kwargs):
+        response = device.arc_msg(message, **kwargs)
+        if len(response) < 2 or response[1] != 0:
+            raise RuntimeError(f"Blackhole firmware failed to {operation}: {response}")
+        return response
+
     # We only send GO_BUSY/GO_IDLE on BH if kmd < 2.6.0
     driver = get_driver_version()
     if not is_driver_version_at_least(driver, "2.6.0"):
@@ -241,24 +272,46 @@ def stop_burnin_bh(device):
     # Stop the RISC loops before resetting complete Tensix tiles.
     device.noc_broadcast32(0, SOFT_RESET_ADDR, SOFT_RESET_DATA)
 
+    # Always scrub every functional core, including cores carrying an image
+    # left by an earlier interrupted run. The current run's set is retained for
+    # defensive compatibility with callers whose location list changes.
+    scrub_cores = {CoreId(*core) for core in device.get_tensix_locations()}
+    if loaded_cores is not None:
+        scrub_cores.update(loaded_cores)
+
     # This sequence mirrors tensix_reset_sequence() in the Blackhole firmware
     # e2e tests. Keep AICLK at the firmware-qualified reset frequency while the
     # tile and NOC state are rebuilt, and always release that temporary force.
-    device.arc_msg(TT_SMC_MSG_FORCE_AICLK, arg0=250, arg1=0)
+    checked_arc_msg(
+        TT_SMC_MSG_FORCE_AICLK,
+        "force the reset-safe AICLK",
+        arg0=250,
+        arg1=0,
+    )
     try:
         for address in TENSIX_RISC_RESET_ADDRS:
             device.axi_write32(address, 0)
 
-        device.arc_msg(TT_SMC_MSG_TOGGLE_TENSIX_RESET)
-        device.arc_msg(TT_SMC_MSG_REINIT_TENSIX)
+        checked_arc_msg(TT_SMC_MSG_TOGGLE_TENSIX_RESET, "reset the Tensix tiles")
+        checked_arc_msg(TT_SMC_MSG_REINIT_TENSIX, "reinitialize the Tensix tiles")
 
         # The tile reset clears this register. Reassert every RISC's soft reset
-        # before releasing the ASIC-level RISC reset signals.
+        # before touching L1 or releasing the ASIC-level RISC reset signals.
         device.noc_broadcast32(1, SOFT_RESET_ADDR, SOFT_RESET_DATA)
+
+        # A complete tile reset clears engine state but preserves Tensix L1
+        # SRAM. Erase the retained image after reset/reinit, verify the erase,
+        # and only then allow the ASIC-level RISC reset signals to be released.
+        scrub_burnin_bh(device, scrub_cores)
         for address in TENSIX_RISC_RESET_ADDRS:
             device.axi_write32(address, 0xFFFFFFFF)
     finally:
-        device.arc_msg(TT_SMC_MSG_FORCE_AICLK, arg0=0, arg1=0)
+        checked_arc_msg(
+            TT_SMC_MSG_FORCE_AICLK,
+            "release the reset-safe AICLK",
+            arg0=0,
+            arg1=0,
+        )
 
 
 def positive_int(value):
@@ -575,6 +628,7 @@ def main():
     dwell_sample_count = 0
     limited_aiclk_devices = []
     changed_tdp_devices = []
+    loaded_bh_cores = {}
     driver = get_driver_version()
     kmd_power_management = is_driver_version_at_least(driver, "2.6.0")
     try:
@@ -639,7 +693,7 @@ def main():
             if isinstance(device, WhChip):
                 start_burnin_wh(device, **kwargs)
             elif isinstance(device, BhChip):
-                start_burnin_bh(device, **kwargs)
+                loaded_bh_cores[id(device)] = start_burnin_bh(device, **kwargs)
 
                 # The workload does not require these domains. If explicitly
                 # requested for board-power coverage, add them only after the
@@ -731,7 +785,7 @@ def main():
             if isinstance(device, WhChip):
                 stop_burnin_wh(device)
             elif isinstance(device, BhChip):
-                stop_burnin_bh(device)
+                stop_burnin_bh(device, loaded_bh_cores.get(id(device)))
             else:
                 raise NotImplementedError(f"Don't support {device}")
 

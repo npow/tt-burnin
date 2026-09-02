@@ -12,6 +12,7 @@ from tt_burnin.main import (
     set_burnin_power_state,
     set_host_aiclk_limit,
     set_tdp_limit,
+    scrub_burnin_bh,
     start_burnin_bh,
     stop_burnin_bh,
     wait_with_power_checks,
@@ -22,6 +23,9 @@ class FakeChip:
     def __init__(self):
         self.broadcasts = []
         self.writes = []
+        self.block_writes = []
+        self.block_broadcasts = []
+        self.block_reads = []
         self.axi_writes = []
         self.messages = []
 
@@ -34,11 +38,21 @@ class FakeChip:
     def noc_write32(self, *args):
         self.writes.append(args)
 
+    def noc_write(self, *args):
+        self.block_writes.append(args)
+
+    def noc_broadcast(self, *args):
+        self.block_broadcasts.append(args)
+
+    def noc_read(self, *args):
+        self.block_reads.append(args[:-1])
+
     def axi_write32(self, *args):
         self.axi_writes.append(args)
 
     def arc_msg(self, *args, **kwargs):
         self.messages.append((args, kwargs))
+        return (0, 0)
 
 
 class FakeRawBlackhole:
@@ -125,13 +139,15 @@ class MainTests(unittest.TestCase):
         device = FakeChip()
         progress = []
 
-        start_burnin_bh(
+        loaded_cores = start_burnin_bh(
             device,
             no_check=True,
             ramp_step=1,
             max_cores=2,
             after_batch=lambda released, total: progress.append((released, total)),
         )
+
+        self.assertEqual(loaded_cores, {CoreId(1, 2), CoreId(10, 2)})
 
         load_ttx_file.assert_called_once_with(
             device,
@@ -172,7 +188,13 @@ class MainTests(unittest.TestCase):
     ):
         device = FakeChip()
 
-        stop_burnin_bh(device)
+        with patch("tt_burnin.main.scrub_burnin_bh") as scrub:
+            stop_burnin_bh(device, {CoreId(1, 2)})
+
+        scrub.assert_called_once_with(
+            device,
+            {CoreId(1, 2), CoreId(10, 2), CoreId(2, 3)},
+        )
 
         soft_reset = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18)
         self.assertEqual(
@@ -211,13 +233,83 @@ class MainTests(unittest.TestCase):
             device.messages.append((args, kwargs))
             if args == (0xAF,):
                 raise RuntimeError("reset failed")
+            return (0, 0)
 
         device.arc_msg = fail_full_tensix_reset
 
-        with self.assertRaisesRegex(RuntimeError, "reset failed"):
-            stop_burnin_bh(device)
+        with patch("tt_burnin.main.scrub_burnin_bh"):
+            with self.assertRaisesRegex(RuntimeError, "reset failed"):
+                stop_burnin_bh(device, {CoreId(1, 2)})
 
         self.assertEqual(device.messages[-1], ((0x33,), {"arg0": 0, "arg1": 0}))
+
+    @patch("tt_burnin.main.read_bin_image_chunks")
+    @patch("tt_burnin.main.TtxFile")
+    @patch("tt_burnin.main.path")
+    def test_blackhole_scrub_erases_every_loaded_image_region(
+        self,
+        resource_path,
+        ttx_file,
+        read_chunks,
+    ):
+        data_path = MagicMock()
+        data_path.joinpath.return_value = "/tmp/bhpv.ttx"
+        resource_path.return_value.__enter__.return_value = data_path
+        ttx = MagicMock()
+        ttx_file.return_value.__enter__.return_value = ttx
+        ttx.open.side_effect = ["image", "ckernels"]
+        read_chunks.side_effect = [
+            [(0x1000, b"image")],
+            [(0x2000, b"kernel")],
+        ]
+        device = FakeChip()
+        cores = {CoreId(1, 2), CoreId(10, 2)}
+
+        scrub_burnin_bh(device, cores)
+
+        self.assertEqual(
+            device.block_broadcasts,
+            [
+                (0, 0x1000, bytes(5)),
+                (0, 0x2000, bytes(6)),
+            ],
+        )
+        self.assertEqual(
+            device.block_reads,
+            [
+                (0, 1, 2, 0x1000),
+                (0, 1, 2, 0x1001),
+                (0, 10, 2, 0x1000),
+                (0, 10, 2, 0x1001),
+                (0, 1, 2, 0x2000),
+                (0, 1, 2, 0x2002),
+                (0, 10, 2, 0x2000),
+                (0, 10, 2, 0x2002),
+            ],
+        )
+
+    @patch("tt_burnin.main.read_bin_image_chunks", return_value=[(0x1000, b"image")])
+    @patch("tt_burnin.main.TtxFile")
+    @patch("tt_burnin.main.path")
+    def test_blackhole_scrub_fails_if_a_core_retains_the_image(
+        self,
+        resource_path,
+        ttx_file,
+        _read_chunks,
+    ):
+        data_path = MagicMock()
+        data_path.joinpath.return_value = "/tmp/bhpv.ttx"
+        resource_path.return_value.__enter__.return_value = data_path
+        ttx_file.return_value.__enter__.return_value = MagicMock()
+        device = FakeChip()
+
+        def retain_image(_noc, _x, _y, _address, observed):
+            observed[0] = 1
+
+        device.noc_read = retain_image
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to scrub BHPV"):
+            scrub_burnin_bh(device, {CoreId(1, 2)})
 
 
 if __name__ == "__main__":
