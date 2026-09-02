@@ -13,6 +13,7 @@ from tt_burnin.main import (
     set_host_aiclk_limit,
     set_tdp_limit,
     start_burnin_bh,
+    stop_burnin_bh,
     wait_with_power_checks,
 )
 
@@ -21,6 +22,7 @@ class FakeChip:
     def __init__(self):
         self.broadcasts = []
         self.writes = []
+        self.axi_writes = []
         self.messages = []
 
     def get_tensix_locations(self):
@@ -32,8 +34,11 @@ class FakeChip:
     def noc_write32(self, *args):
         self.writes.append(args)
 
-    def arc_msg(self, message):
-        self.messages.append(message)
+    def axi_write32(self, *args):
+        self.axi_writes.append(args)
+
+    def arc_msg(self, *args, **kwargs):
+        self.messages.append((args, kwargs))
 
 
 class FakeRawBlackhole:
@@ -157,6 +162,62 @@ class MainTests(unittest.TestCase):
         start_burnin_bh(device, idle=True, ramp_step=1, max_cores=1)
         load_ttx_file.assert_not_called()
         self.assertEqual(device.writes, [(0, 1, 2, 0xFFB121B0, 1 << 18)])
+
+    @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
+    @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
+    def test_blackhole_stop_resets_complete_tensix_tiles(
+        self,
+        _get_driver_version,
+        _is_driver_version_at_least,
+    ):
+        device = FakeChip()
+
+        stop_burnin_bh(device)
+
+        soft_reset = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18)
+        self.assertEqual(
+            device.broadcasts,
+            [
+                (0, 0xFFB121B0, soft_reset),
+                (1, 0xFFB121B0, soft_reset),
+            ],
+        )
+        reset_addresses = [0x80030040 + index * 4 for index in range(8)]
+        self.assertEqual(
+            device.axi_writes,
+            [(address, 0) for address in reset_addresses]
+            + [(address, 0xFFFFFFFF) for address in reset_addresses],
+        )
+        self.assertEqual(
+            device.messages,
+            [
+                ((0x33,), {"arg0": 250, "arg1": 0}),
+                ((0xAF,), {}),
+                ((0x20,), {}),
+                ((0x33,), {"arg0": 0, "arg1": 0}),
+            ],
+        )
+
+    @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
+    @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
+    def test_blackhole_stop_releases_forced_aiclk_after_reset_failure(
+        self,
+        _get_driver_version,
+        _is_driver_version_at_least,
+    ):
+        device = FakeChip()
+
+        def fail_full_tensix_reset(*args, **kwargs):
+            device.messages.append((args, kwargs))
+            if args == (0xAF,):
+                raise RuntimeError("reset failed")
+
+        device.arc_msg = fail_full_tensix_reset
+
+        with self.assertRaisesRegex(RuntimeError, "reset failed"):
+            stop_burnin_bh(device)
+
+        self.assertEqual(device.messages[-1], ((0x33,), {"arg0": 0, "arg1": 0}))
 
 
 if __name__ == "__main__":

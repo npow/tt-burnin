@@ -218,19 +218,47 @@ def start_burnin_bh(
 
 
 def stop_burnin_bh(device):
-    BRISC_SOFT_RESET = 1 << 11
-    TRISC_SOFT_RESETS = (1 << 12) | (1 << 13) | (1 << 14)
-    NCRISC_SOFT_RESET = 1 << 18
+    """Stop BHPV and clear all state that could restart the workload.
+
+    Merely asserting the per-RISC soft-reset register is insufficient for an
+    infinite-loop power virus: stream and math-engine state lives outside the
+    RISC cores and can survive a later power-state transition.  Follow the
+    full-Tensix reset sequence used by the Blackhole firmware end-to-end reset
+    test so opening the device again cannot resume the old workload.
+    """
+    TT_SMC_MSG_REINIT_TENSIX = 0x20
+    TT_SMC_MSG_FORCE_AICLK = 0x33
+    TT_SMC_MSG_TOGGLE_TENSIX_RESET = 0xAF
+    TENSIX_RISC_RESET_ADDRS = tuple(0x80030040 + index * 4 for index in range(8))
+    SOFT_RESET_ADDR = 0xFFB121B0
+    SOFT_RESET_DATA = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18)
 
     # We only send GO_BUSY/GO_IDLE on BH if kmd < 2.6.0
     driver = get_driver_version()
     if not is_driver_version_at_least(driver, "2.6.0"):
         device.arc_msg(0x54)
 
-    # Put tensix back under soft reset
-    device.noc_broadcast32(
-        0, 0xFFB121B0, BRISC_SOFT_RESET | TRISC_SOFT_RESETS | NCRISC_SOFT_RESET
-    )
+    # Stop the RISC loops before resetting complete Tensix tiles.
+    device.noc_broadcast32(0, SOFT_RESET_ADDR, SOFT_RESET_DATA)
+
+    # This sequence mirrors tensix_reset_sequence() in the Blackhole firmware
+    # e2e tests. Keep AICLK at the firmware-qualified reset frequency while the
+    # tile and NOC state are rebuilt, and always release that temporary force.
+    device.arc_msg(TT_SMC_MSG_FORCE_AICLK, arg0=250, arg1=0)
+    try:
+        for address in TENSIX_RISC_RESET_ADDRS:
+            device.axi_write32(address, 0)
+
+        device.arc_msg(TT_SMC_MSG_TOGGLE_TENSIX_RESET)
+        device.arc_msg(TT_SMC_MSG_REINIT_TENSIX)
+
+        # The tile reset clears this register. Reassert every RISC's soft reset
+        # before releasing the ASIC-level RISC reset signals.
+        device.noc_broadcast32(1, SOFT_RESET_ADDR, SOFT_RESET_DATA)
+        for address in TENSIX_RISC_RESET_ADDRS:
+            device.axi_write32(address, 0xFFFFFFFF)
+    finally:
+        device.arc_msg(TT_SMC_MSG_FORCE_AICLK, arg0=0, arg1=0)
 
 
 def positive_int(value):
