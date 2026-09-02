@@ -38,7 +38,13 @@ pip3 install --editable .
 
 Command line arguments
 ```
-usage: tt-burnin [-h] [-v] [--reset_file reset_config.json]
+usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
+                 [--no-check] [--idle] [--ramp-step CORES]
+                 [--ramp-interval SECONDS] [--max-cores CORES]
+                 [--duration SECONDS] [--aiclk-limit MHZ] [--tdp-limit WATTS]
+                 [--enable-gddr] [--enable-l2cpu]
+                 [--max-board-power WATTS]
+                 [--max-total-board-power WATTS]
 ```
 
 ## Getting Help!
@@ -46,7 +52,13 @@ usage: tt-burnin [-h] [-v] [--reset_file reset_config.json]
 Running tt-burnin with the ```-h, --help``` flag should bring up something that looks like this
 
 ```
-usage: tt-burnin [-h] [-v] [--reset_file reset_config.json]
+usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
+                 [--no-check] [--idle] [--ramp-step CORES]
+                 [--ramp-interval SECONDS] [--max-cores CORES]
+                 [--duration SECONDS] [--aiclk-limit MHZ] [--tdp-limit WATTS]
+                 [--enable-gddr] [--enable-l2cpu]
+                 [--max-board-power WATTS]
+                 [--max-total-board-power WATTS]
 
 Tenstorrent Burnin (TT-Burnin) is a command line utility to run a high power consumption workload on TT devices.
 
@@ -55,6 +67,19 @@ optional arguments:
   -v, --version         show program's version number and exit
   --reset_file reset_config.json
                         Provide a custom reset json file for the host.Generate a default reset json file with the -g option with tt-smi.
+  --ramp-step CORES     Release this many Tensix cores per ramp step (default: 1)
+  --ramp-interval SECONDS
+                        Wait this long after each ramp step (default: 1.0)
+  --max-cores CORES     Run on at most this many Tensix cores per device
+  --duration SECONDS    Stop automatically this long after the ramp completes
+  --aiclk-limit MHZ     Temporarily limit Blackhole AICLK; restored on exit
+  --tdp-limit WATTS     Temporarily set Blackhole ASIC TDP; restored on exit
+  --enable-gddr         Wake Blackhole GDDR after the core ramp
+  --enable-l2cpu        Enable Blackhole L2CPU clocks after the core ramp
+  --max-board-power WATTS
+                        Stop if any local board reaches this measured input power
+  --max-total-board-power WATTS
+                        Stop if the local boards reach this combined input power
 ```
 
 ## Running tt-burnin
@@ -63,9 +88,55 @@ After building run `tt-burnin` to run the program.
 
 TT-Burnin performs the following steps when running:
 1. Reset the boards on the host to get them into a known good state
-2. Start the power hungry workload on all boards
+2. Start boards sequentially and release Tensix cores in small batches
 3. Output a realtime telemetry command line widget to monitor the devices
 4. After user hits "enter" to stop the workload, another reset is performed to bring the boards back to known good state
+
+### Safer staged tests
+
+Core activation is staged by default: one core is released per second, and boards
+are started sequentially. A bounded smoke test can explicitly limit the core count
+and duration:
+
+```
+tt-burnin --max-cores 1 --ramp-step 1 --ramp-interval 5 --duration 3
+```
+
+On Blackhole, TT-Burnin keeps GDDR/MRISC and L2CPU powered down because the BHPV
+workload runs on Tensix with local L1/NOC traffic. Only Tensix and max AICLK are
+requested, avoiding the unrelated power step caused by the legacy `high` profile.
+For finer startup control, `--aiclk-limit` applies the firmware's temporary,
+device-validated host ceiling and restores the default during cleanup:
+
+```
+tt-burnin --aiclk-limit 900 --max-cores 1 --duration 3
+```
+
+`--tdp-limit` similarly applies a temporary firmware-validated ASIC limit and
+restores the previous runtime value during cleanup. It is a reactive control and
+does not prevent short power excursions.
+
+For board-power testing beyond the BHPV workload itself, `--enable-gddr` and
+`--enable-l2cpu` add those otherwise-unused domains only after every selected
+Tensix core has completed its staged start.
+
+The optional telemetry cutoffs take values chosen for the actual cards and host,
+so TT-Burnin does not invent a universal wattage limit:
+
+```
+tt-burnin --max-board-power <per-card-watts> \
+  --max-total-board-power <host-total-watts>
+```
+
+These cutoffs are reactive software checks. They stop the workload and return the
+devices to low power after telemetry reaches a cutoff, but they cannot prevent a
+short transient or substitute for adequate board and host power delivery. Use
+`--ramp-step 0` only when the legacy simultaneous core release is intentional.
+Pressing Enter also stops immediately between ramp samples; it is not deferred
+until every core has started.
+
+At exit, TT-Burnin reports both the peak sampled board input power across startup
+and the average/range sampled during the sustained post-ramp dwell.
 
 A full run of burnin should look like - 
 
