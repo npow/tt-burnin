@@ -47,6 +47,7 @@ optional-dependencies.dev = [
 
 [project.scripts]
 tt-burnin = "tt_burnin.main:main"
+tt-burnin-containment-test = "tt_burnin.containment_acceptance:main"
 
 [tool.setuptools]
 include-package-data = true

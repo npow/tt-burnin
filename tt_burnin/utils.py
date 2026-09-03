@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass
 from typing import List
 import sys
 import os
@@ -9,18 +10,15 @@ import json
 import jsons
 import time
 import random
+import glob
+import platform
 from concurrent.futures import ThreadPoolExecutor
 from rich.table import Table
 
 from rich import get_console
 from pyluwen import PciChip
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
-from tt_tools_common.reset_common.bh_reset import BHChipReset
-from tt_tools_common.reset_common.wh_reset import WHChipReset
 from tt_tools_common.reset_common.galaxy_reset import GalaxyReset
-from tt_tools_common.utils_common.tools_utils import (
-    detect_chips_with_callback,
-)
 from tt_tools_common.utils_common.system_utils import (
     get_driver_version,
     is_driver_version_at_least,
@@ -28,55 +26,179 @@ from tt_tools_common.utils_common.system_utils import (
 from pyluwen import (
     detect_chips_fallible,
     run_wh_ubb_ipmi_reset,
-    run_ubb_wait_for_driver_load
+    run_ubb_wait_for_driver_load,
 )
 from tt_burnin.chip import RemoteWhChip, WhChip
 
 
-def pci_board_reset(list_of_boards: List[int], reinit=False):
-    """Given a list of pci index's init the pci chip and call reset on it"""
+@dataclass(frozen=True)
+class _ResetTarget:
+    interface_id: int
+    bdf: str
+    board_id: int
+    architecture: str
 
-    reset_wh_pci_idx = []
-    reset_bh_pci_idx = []
-    for pci_idx in list_of_boards:
+
+def _chip_architecture(chip) -> str:
+    if chip.as_wh() is not None:
+        return "wormhole"
+    if chip.as_bh() is not None:
+        return "blackhole"
+    raise RuntimeError("Only Wormhole and Blackhole PCI devices can be reset")
+
+
+def _preflight_reset_targets(list_of_boards: List[int]) -> List[_ResetTarget]:
+    """Resolve every target before allowing the first reset to change hardware."""
+    driver = get_driver_version()
+    if driver is None or not is_driver_version_at_least(driver, "2.6.0"):
+        raise RuntimeError(
+            "Power-aware PCI reset requires tt-kmd 2.6.0 or newer; refusing "
+            "to use an unprotected reset path"
+        )
+    if platform.machine().lower().startswith(("arm", "aarch")):
+        raise RuntimeError("PCI board reset is not supported on Arm hosts")
+    if os.path.exists("/sys/hypervisor/type"):
         try:
-            chip = PciChip(pci_interface=pci_idx)
-        except Exception as e:
-            print(
-                CMD_LINE_COLOR.RED,
-                f"Error accessing board at pci index {pci_idx}! Use -ls to see all devices available to reset",
-                CMD_LINE_COLOR.ENDC,
+            with open("/sys/hypervisor/type", "r") as type_file:
+                hypervisor = type_file.read().strip()
+            with open("/sys/hypervisor/guest_type", "r") as guest_file:
+                guest_type = guest_file.read().strip()
+        except OSError:
+            hypervisor = guest_type = ""
+        if hypervisor == "xen" and guest_type == "HVM":
+            raise RuntimeError(
+                "Power-aware PCI reset is not implemented for Xen HVM guests"
             )
-        if chip.as_wh():
-            reset_wh_pci_idx.append(pci_idx)
-        elif chip.as_bh():
-            reset_bh_pci_idx.append(pci_idx)
+
+    targets = []
+    for interface_id in dict.fromkeys(list_of_boards):
+        try:
+            chip = PciChip(pci_interface=interface_id)
+            target = _ResetTarget(
+                interface_id=interface_id,
+                bdf=chip.get_pci_bdf(),
+                board_id=chip.board_id(),
+                architecture=_chip_architecture(chip),
+            )
+            del chip
+
+            # Opening with O_APPEND opts into KMD's power-aware reset handling.
+            # Probe every target now so a later permissions/device error cannot
+            # leave a predictably half-reset group.
+            fd = os.open(
+                f"/dev/tenstorrent/{interface_id}",
+                os.O_RDWR | os.O_CLOEXEC | os.O_APPEND,
+            )
+            os.close(fd)
+        except Exception as error:
+            raise RuntimeError(
+                f"Cannot safely reset Tenstorrent PCI interface {interface_id}: {error}"
+            ) from error
+        targets.append(target)
+
+    if not targets:
+        raise RuntimeError("No local Tenstorrent PCI devices were selected for reset")
+    return targets
+
+
+def _wait_for_interface_at_bdf(bdf: str, timeout: float = 10.0) -> int:
+    """Return the current interface id at a stable BDF after hotplug/reset."""
+    deadline = time.monotonic() + timeout
+    pattern = f"/sys/bus/pci/devices/{bdf}/tenstorrent/tenstorrent!*"
+    while time.monotonic() < deadline:
+        for match in glob.glob(pattern):
+            name = os.path.basename(match)
+            _, _, suffix = name.partition("!")
+            if suffix.isdigit() and os.path.exists(f"/dev/tenstorrent/{suffix}"):
+                return int(suffix)
+        time.sleep(0.05)
+    raise RuntimeError(f"Timed out waiting for Tenstorrent device at {bdf} to reappear")
+
+
+def _wait_for_reset_completion(bdf: str, timeout: float = 10.0) -> None:
+    """Wait for hotplug completion or the KMD reset marker to clear."""
+    deadline = time.monotonic() + timeout
+    device_path = f"/sys/bus/pci/devices/{bdf}"
+    config_path = f"{device_path}/config"
+    disappeared = False
+    while time.monotonic() < deadline:
+        if not os.path.exists(device_path):
+            disappeared = True
+        elif disappeared:
+            return
         else:
-            print(f"{CMD_LINE_COLOR.RED}Unknown chip!!{CMD_LINE_COLOR.ENDC}")
-            sys.exit(1)
+            try:
+                with open(config_path, "rb") as config:
+                    config.seek(4)
+                    command_low = config.read(1)
+                if len(command_low) == 1 and not (command_low[0] & (1 << 6)):
+                    return
+            except OSError:
+                pass
+        time.sleep(0.05)
+    raise RuntimeError(f"Timed out waiting for reset completion at {bdf}")
 
-    # reset wh devices with pci indices
-    if len(reset_wh_pci_idx) > 0:
-        WHChipReset().full_lds_reset(pci_interfaces=reset_wh_pci_idx, silent=True)
 
-    if len(reset_bh_pci_idx) > 0:
-        BHChipReset().full_lds_reset(pci_interfaces=reset_bh_pci_idx, silent=True)
+def _checked_reset_ioctl(interface_id: int, flag: int, operation: str):
+    try:
+        succeeded = _reset_device_ioctl(interface_id, flag)
+    except OSError as error:
+        raise RuntimeError(
+            f"{operation} ioctl failed for PCI interface {interface_id}: {error}"
+        ) from error
+    if not succeeded:
+        raise RuntimeError(f"{operation} was rejected for PCI interface {interface_id}")
+
+
+def pci_board_reset(list_of_boards: List[int], reinit=False):
+    """Perform a fail-closed, power-aware reset and return redetected chips."""
+    targets = _preflight_reset_targets(list_of_boards)
+
+    # Match the KMD reset ordering, but require every stage to succeed. The
+    # shared tools implementation currently continues after an SBR failure and
+    # does not check the ASIC_RESET result.
+    for target in targets:
+        _checked_reset_ioctl(
+            target.interface_id, _RESET_FLAG_PCIE_LINK, "PCIe link reset"
+        )
+    for target in targets:
+        _checked_reset_ioctl(target.interface_id, _RESET_FLAG_ASIC, "ASIC reset")
+
+    time.sleep(max(2.0, 0.4 * len(targets)))
+    reset_chips = []
+    for target in targets:
+        _wait_for_reset_completion(target.bdf)
+        new_interface_id = _wait_for_interface_at_bdf(target.bdf)
+        _checked_reset_ioctl(new_interface_id, _RESET_FLAG_POST, "post-reset")
+        chip = PciChip(pci_interface=new_interface_id)
+        observed = _ResetTarget(
+            interface_id=new_interface_id,
+            bdf=chip.get_pci_bdf(),
+            board_id=chip.board_id(),
+            architecture=_chip_architecture(chip),
+        )
+        if (
+            observed.bdf != target.bdf
+            or observed.board_id != target.board_id
+            or observed.architecture != target.architecture
+        ):
+            raise RuntimeError(
+                f"Device identity changed across reset at {target.bdf}: "
+                f"expected board {target.board_id:#x} ({target.architecture}), "
+                f"found board {observed.board_id:#x} ({observed.architecture})"
+            )
+        reset_chips.append(chip)
 
     if reinit:
         print(
             CMD_LINE_COLOR.PURPLE,
-            f"Re-initializing boards after reset....",
+            "Re-initializing boards after reset....",
             CMD_LINE_COLOR.ENDC,
         )
-        try:
-            chips = detect_chips_with_callback()
-        except Exception as e:
-            print(
-                CMD_LINE_COLOR.RED,
-                f"Error when re-initializing chips!\n {e}",
-                CMD_LINE_COLOR.ENDC,
-            )
-            sys.exit(1)
+        # Constructing and validating each returned PciChip above is the
+        # reinitialization. Do not run a second broad detection pass here.
+
+    return reset_chips
 
 
 def pci_indices_from_json(json_dict):
@@ -131,20 +253,9 @@ def parse_reset_input(value):
             data = json.load(json_file)
             return data
     except json.JSONDecodeError as e:
-        print(
-            CMD_LINE_COLOR.RED,
-            f"Please check the format of the json file.\n {e}",
-            CMD_LINE_COLOR.ENDC,
-        )
-        sys.exit(1)
-    except FileNotFoundError:
-        # If no file found, attempt to parse as a list of comma separated integers
-        print(
-            CMD_LINE_COLOR.YELLOW,
-            "File not found!\n To generate a reset json config file run tt-smi -g",
-            CMD_LINE_COLOR.ENDC,
-        )
-        return None
+        raise ValueError(f"Invalid reset JSON in {value}: {e}") from e
+    except FileNotFoundError as e:
+        raise ValueError(f"Reset configuration file not found: {value}") from e
 
 
 def print_all_available_devices(devices):
@@ -175,6 +286,7 @@ def print_all_available_devices(devices):
             f"{coords}",
         )
     console.print(table)
+
 
 def get_board_type(board_id: str) -> str:
     """
@@ -237,11 +349,13 @@ def get_board_type(board_id: str) -> str:
     else:
         return "N/A"
 
+
 def prefix_color_picker(current_value, max_value):
     if current_value < max_value * 0.85:
         return "[green]"
     else:
         return "[orange3]"
+
 
 def asic_temperature_parser(temp, dev):
     """ASIC temperature is reported with different schema for BH vs other chips"""
@@ -251,17 +365,19 @@ def asic_temperature_parser(temp, dev):
     else:
         return (temp & 0xFFFF) / 16
 
+
 def timed_wait(seconds):
     """Wait for a specified number of seconds, printing the progress."""
-    print("\033[93mWaiting for {} seconds: 0\033[0m".format(seconds), end='')
+    print("\033[93mWaiting for {} seconds: 0\033[0m".format(seconds), end="")
     sys.stdout.flush()
 
     for i in range(1, seconds + 1):
         time.sleep(1)
         # Move cursor back and overwrite the number
-        print("\r\033[93mWaiting for {} seconds: {}\033[0m".format(seconds, i), end='')
+        print("\r\033[93mWaiting for {} seconds: {}\033[0m".format(seconds, i), end="")
         sys.stdout.flush()
     print()
+
 
 # KMD reset ioctl (TENSTORRENT_IOCTL_RESET_DEVICE). The Galaxy IPMI tray reset on
 # its own leaves the ASICs with ARC uninitialized (detection then fails with
@@ -272,6 +388,7 @@ _TT_IOCTL_MAGIC = 0xFA
 _TT_IOCTL_RESET_DEVICE = (_TT_IOCTL_MAGIC << 8) | 6
 _RESET_FLAG_PCIE_LINK = 1
 _RESET_FLAG_USER = 3
+_RESET_FLAG_ASIC = 4
 _RESET_FLAG_POST = 6
 
 
@@ -281,6 +398,20 @@ def _tt_interface_ids() -> List[int]:
         return sorted(int(e) for e in os.listdir("/dev/tenstorrent") if e.isdigit())
     except OSError:
         return []
+
+
+def tenstorrent_pci_bdfs() -> List[str]:
+    """Return every Tenstorrent PCI function present in sysfs, bound or not."""
+    bdfs = []
+    for vendor_path in glob.glob("/sys/bus/pci/devices/*/vendor"):
+        try:
+            with open(vendor_path, "r") as vendor_file:
+                vendor = vendor_file.read().strip().lower()
+        except OSError:
+            continue
+        if vendor == "0x1e52":
+            bdfs.append(os.path.basename(os.path.dirname(vendor_path)))
+    return sorted(bdfs)
 
 
 def _reset_device_ioctl(interface_id: int, flags: int) -> bool:
@@ -334,7 +465,9 @@ def reset_6u_glx():
         _reset_all_ioctl(device_ids, _RESET_FLAG_PCIE_LINK)
     _reset_all_ioctl(device_ids, _RESET_FLAG_USER)
 
-    run_wh_ubb_ipmi_reset(ubb_num="0xF", dev_num="0xFF", op_mode="0x0", reset_time="0xF")
+    run_wh_ubb_ipmi_reset(
+        ubb_num="0xF", dev_num="0xFF", op_mode="0x0", reset_time="0xF"
+    )
     timed_wait(30)
     run_ubb_wait_for_driver_load()
 
@@ -374,6 +507,7 @@ def reset_6u_glx():
         # Error out if chips don't initalize
     return
 
+
 def generate_table(devices) -> Table:
     """Make a table to display telemetry values."""
     table = Table(
@@ -392,7 +526,9 @@ def generate_table(devices) -> Table:
         voltage = int(hex(telem["vcore"]), 16) / 1000
         aiclk = int(hex(telem["aiclk"]), 16) & 0xFFFF
         power = int(hex(telem["tdp"]), 16) & 0xFFFF
-        asic_temperature = asic_temperature_parser(int(hex(telem["asic_temperature"]), 16), dev)
+        asic_temperature = asic_temperature_parser(
+            int(hex(telem["asic_temperature"]), 16), dev
+        )
         vdd_max = int(hex(telem["vdd_limits"]), 16) >> 16
         if dev.as_bh():
             curr_limit = int(hex(telem["tdc_limit_max"]), 16)

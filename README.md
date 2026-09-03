@@ -42,6 +42,7 @@ usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
                  [--no-check] [--idle] [--ramp-step CORES]
                  [--ramp-interval SECONDS] [--max-cores CORES]
                  [--duration SECONDS] [--aiclk-limit MHZ] [--tdp-limit WATTS]
+                 [--board-power-limit WATTS]
                  [--enable-gddr] [--enable-l2cpu]
                  [--max-board-power WATTS]
                  [--max-total-board-power WATTS]
@@ -56,6 +57,7 @@ usage: tt-burnin [-h] [-v] [--reset_file reset_config.json] [--no-reset]
                  [--no-check] [--idle] [--ramp-step CORES]
                  [--ramp-interval SECONDS] [--max-cores CORES]
                  [--duration SECONDS] [--aiclk-limit MHZ] [--tdp-limit WATTS]
+                 [--board-power-limit WATTS]
                  [--enable-gddr] [--enable-l2cpu]
                  [--max-board-power WATTS]
                  [--max-total-board-power WATTS]
@@ -74,6 +76,8 @@ optional arguments:
   --duration SECONDS    Stop automatically this long after the ramp completes
   --aiclk-limit MHZ     Temporarily limit Blackhole AICLK; restored on exit
   --tdp-limit WATTS     Temporarily set Blackhole ASIC TDP; restored on exit
+  --board-power-limit WATTS
+                        Apply and verify the firmware board-power policy after reset
   --enable-gddr         Wake Blackhole GDDR after the core ramp
   --enable-l2cpu        Enable Blackhole L2CPU clocks after the core ramp
   --max-board-power WATTS
@@ -106,7 +110,7 @@ On Blackhole, TT-Burnin keeps GDDR/MRISC and L2CPU powered down because the BHPV
 workload runs on Tensix with local L1/NOC traffic. Only Tensix and max AICLK are
 requested, avoiding the unrelated power step caused by the legacy `high` profile.
 For finer startup control, `--aiclk-limit` applies the firmware's temporary,
-device-validated host ceiling and restores the default during cleanup:
+device-validated host ceiling and restores the previous ceiling during cleanup:
 
 ```
 tt-burnin --aiclk-limit 900 --max-cores 1 --duration 3
@@ -115,6 +119,30 @@ tt-burnin --aiclk-limit 900 --max-cores 1 --duration 3
 `--tdp-limit` similarly applies a temporary firmware-validated ASIC limit and
 restores the previous runtime value during cleanup. It is a reactive control and
 does not prevent short power excursions.
+
+`--board-power-limit` is applied after TT-Burnin's initial device reset and
+verified through firmware telemetry before any workload core is released. This
+prevents the reset from silently discarding a policy configured before TT-Burnin
+started:
+
+```
+tt-burnin --board-power-limit 300 --aiclk-limit 1350 --duration 180
+```
+
+Blackhole runs also require firmware runtime-power status to report policy-ready,
+strict enforcement, and a fresh input-power sample before TT-Burnin enables a
+workload. A latched firmware containment trip aborts the workload immediately.
+The end-to-end acceptance harness deliberately trips a low limit, proves that the
+boot ID and every board identity survived, resets by stable PCI BDF, and requires
+the 300 W policy to return ready/strict/fresh before it passes:
+
+```
+tt-burnin-containment-test --run
+```
+
+It persists progress in `/var/tmp/tt-burnin-containment-acceptance.json`. After
+an interrupted run or suspected reboot, check that record without starting a
+workload using `tt-burnin-containment-test --check-previous`.
 
 For board-power testing beyond the BHPV workload itself, `--enable-gddr` and
 `--enable-l2cpu` add those otherwise-unused domains only after every selected
