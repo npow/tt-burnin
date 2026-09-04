@@ -479,8 +479,8 @@ def parse_args():
         "--enable-l2cpu",
         action="store_true",
         help=(
-            "Enable Blackhole L2CPU clocks after the core ramp. BHPV does not "
-            "use L2CPU; this option adds board-power coverage."
+            "Compatibility option; Blackhole L2CPU management clocks always "
+            "remain enabled for host safety"
         ),
     )
     parser.add_argument(
@@ -541,13 +541,14 @@ def set_burnin_power_state(device, mrisc=False, l2cpu=False):
     try:
         if device.as_bh() is not None:
             # BHPV runs entirely on Tensix using local L1/NOC traffic. Waking
-            # GDDR/MRISC and L2CPU adds a large board-power step without helping
-            # the workload.
+            # GDDR/MRISC adds a board-power step without helping the workload.
+            # L2CPU remains enabled because it hosts PCIe/management services;
+            # runtime firmware deliberately rejects attempts to gate it.
             device.set_power(
                 aiclk=True,
                 mrisc=mrisc,
                 tensix=True,
-                l2cpu=l2cpu,
+                l2cpu=True,
                 pcie=True,
             )
         else:

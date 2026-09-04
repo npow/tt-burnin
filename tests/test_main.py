@@ -122,7 +122,7 @@ class MainTests(unittest.TestCase):
             with self.assertRaises(BurninStopped):
                 wait_with_power_checks([], 10, check_stdin=True)
 
-    def test_blackhole_power_profile_controls_optional_domains(self):
+    def test_blackhole_power_profile_keeps_management_l2cpu_enabled(self):
         device = FakeRawBlackhole()
         set_burnin_power_state(device)
         self.assertEqual(
@@ -131,12 +131,16 @@ class MainTests(unittest.TestCase):
                 "aiclk": True,
                 "mrisc": False,
                 "tensix": True,
-                "l2cpu": False,
+                "l2cpu": True,
                 "pcie": True,
             },
         )
         set_burnin_power_state(device, mrisc=True, l2cpu=True)
         self.assertEqual(device.power["mrisc"], True)
+        self.assertEqual(device.power["l2cpu"], True)
+
+        set_burnin_power_state(device, mrisc=False, l2cpu=False)
+        self.assertEqual(device.power["mrisc"], False)
         self.assertEqual(device.power["l2cpu"], True)
 
     def test_host_aiclk_limit_is_set_and_restored(self):
