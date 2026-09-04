@@ -567,8 +567,10 @@ _BH_TAG_INPUT_POWER = 54
 _BH_TAG_AICLK_LIMIT_MAX = 63
 _BH_TAG_TDP_LIMIT_MAX = 64
 _BH_TAG_HOST_AICLK_LIMIT = 70
-_BH_TAG_RUNTIME_POWER_FAULT = 80
-_BH_RUNTIME_POWER_FAULT_LATCHED = 1 << 0
+_BH_TAG_RUNTIME_POWER_STATUS = 80
+_BH_RUNTIME_POWER_STATUS_ABI_MASK = 0xFFFF0000
+_BH_RUNTIME_POWER_STATUS_ABI_VALUE = 0x52500000
+_BH_RUNTIME_POWER_STATUS_RESERVED = 1 << 0
 _BH_RUNTIME_POWER_STRICT = 1 << 1
 _BH_RUNTIME_POWER_SAMPLE_FRESH = 1 << 2
 _BH_RUNTIME_POWER_POLICY_READY = 1 << 3
@@ -577,6 +579,15 @@ _BH_RUNTIME_POWER_REQUIRED = (
     | _BH_RUNTIME_POWER_SAMPLE_FRESH
     | _BH_RUNTIME_POWER_POLICY_READY
 )
+
+# Compatibility aliases for the retired deliberate-trip acceptance helper.
+# Bit 0 is reserved in the non-latching runtime controller and must never be set.
+_BH_TAG_RUNTIME_POWER_FAULT = _BH_TAG_RUNTIME_POWER_STATUS
+_BH_RUNTIME_POWER_FAULT_LATCHED = _BH_RUNTIME_POWER_STATUS_RESERVED
+
+
+class UnsupportedRuntimePowerStatus(RuntimeError):
+    pass
 
 
 def read_bh_telemetry_tag(device, tag):
@@ -605,16 +616,22 @@ def _verify_bh_telemetry(device, tag, expected, description):
 
 
 def check_runtime_power_status(devices):
-    """Fail if Blackhole's electrical policy is unavailable or has tripped."""
+    """Require the signed runtime electrical-policy ABI and all ready bits."""
     for index, device in enumerate(devices):
         if device.as_bh() is None:
             continue
-        status = read_bh_telemetry_tag(device, _BH_TAG_RUNTIME_POWER_FAULT)
-        trip_watts = status >> 16
-        if status & _BH_RUNTIME_POWER_FAULT_LATCHED:
+        status = read_bh_telemetry_tag(device, _BH_TAG_RUNTIME_POWER_STATUS)
+        if (
+            status & _BH_RUNTIME_POWER_STATUS_ABI_MASK
+        ) != _BH_RUNTIME_POWER_STATUS_ABI_VALUE:
+            raise UnsupportedRuntimePowerStatus(
+                f"Blackhole device {index} firmware does not expose the supported "
+                f"runtime power-status ABI (status {status:#010x})"
+            )
+        if status & _BH_RUNTIME_POWER_STATUS_RESERVED:
             raise RuntimeError(
-                f"Blackhole device {index} firmware board-power containment "
-                f"tripped at {trip_watts} W"
+                f"Blackhole device {index} firmware returned malformed runtime "
+                f"power status {status:#010x}"
             )
         missing = _BH_RUNTIME_POWER_REQUIRED & ~status
         if missing:
@@ -633,7 +650,7 @@ def wait_for_runtime_power_status(devices, timeout=2.0):
             check_runtime_power_status(devices)
             return
         except RuntimeError as error:
-            if "containment tripped" in str(error):
+            if isinstance(error, UnsupportedRuntimePowerStatus):
                 raise
             last_error = error
             time.sleep(0.05)

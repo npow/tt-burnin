@@ -72,7 +72,7 @@ class FakeRawBlackhole:
             63: 1350,
             64: 150,
             70: 0,
-            80: 0xE,
+            80: 0x5250000E,
         }
 
     def as_bh(self):
@@ -200,15 +200,21 @@ class MainTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not cover every"):
             preflight_run_support(args, [FakeRawBlackhole()], "2.11.0")
 
-    def test_runtime_power_fault_aborts_the_workload(self):
+    def test_reserved_runtime_power_status_aborts_the_workload(self):
         device = FakeRawBlackhole()
-        device.telemetry[80] = (312 << 16) | 0xF
-        with self.assertRaisesRegex(RuntimeError, "tripped at 312 W"):
+        device.telemetry[80] = 0x5250000F
+        with self.assertRaisesRegex(RuntimeError, "malformed runtime power status"):
+            check_runtime_power_status([device])
+
+    def test_old_firmware_adjacent_word_cannot_authorize_the_workload(self):
+        device = FakeRawBlackhole()
+        device.telemetry[80] = 0xE
+        with self.assertRaisesRegex(RuntimeError, "does not expose the supported"):
             check_runtime_power_status([device])
 
     def test_runtime_power_policy_must_be_strict_fresh_and_ready(self):
         device = FakeRawBlackhole()
-        device.telemetry[80] = 0xA
+        device.telemetry[80] = 0x5250000A
         with self.assertRaisesRegex(RuntimeError, "missing bits 0x4"):
             check_runtime_power_status([device])
 
