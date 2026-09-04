@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 import sys
 import unittest
+import zipfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tt_burnin.load_ttx import CoreId
@@ -17,7 +20,6 @@ from tt_burnin.main import (
     set_tdp_limit,
     preflight_run_support,
     reset_all_devices,
-    scrub_burnin_bh,
     start_burnin_bh,
     stop_burnin_bh,
     wait_with_power_checks,
@@ -322,162 +324,100 @@ class MainTests(unittest.TestCase):
 
     @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
     @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
-    def test_blackhole_stop_resets_complete_tensix_tiles(
+    def test_blackhole_stop_cooperatively_quiesces_without_reset_messages(
         self,
         _get_driver_version,
         _is_driver_version_at_least,
     ):
         device = FakeChip()
-
-        with patch("tt_burnin.main.scrub_burnin_bh") as scrub:
-            stop_burnin_bh(device, {CoreId(1, 2)})
-
-        scrub.assert_called_once_with(
-            device,
-            {CoreId(1, 2), CoreId(10, 2), CoreId(2, 3)},
+        device.get_tensix_locations = MagicMock(
+            side_effect=AssertionError("cleanup must not discover or read endpoints")
         )
 
-        soft_reset = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18)
+        stop_burnin_bh(device, {CoreId(1, 2)})
+
+        all_compute_soft_reset = 0x7FFFF
+        stream_reset_broadcasts = []
+        for noc in (1, 0):
+            for stream_id in (4, 5, 6):
+                stream_base = 0xFFB40000 + stream_id * 0x1000
+                stream_reset_broadcasts.append((noc, stream_base + 8, 0))
+                stream_reset_broadcasts.append((noc, stream_base + 271 * 4, 1))
         self.assertEqual(
             device.broadcasts,
             [
-                (1, 0xFFB121B0, soft_reset),
+                (1, 0xFFB121B0, all_compute_soft_reset),
+                (0, 0xFFB121B0, all_compute_soft_reset),
+            ]
+            + stream_reset_broadcasts
+            + [
+                (1, 0xFFB121B0, all_compute_soft_reset),
+                (0, 0xFFB121B0, all_compute_soft_reset),
             ],
         )
-        reset_addresses = [0x80030040 + index * 4 for index in range(8)]
-        self.assertEqual(
-            device.axi_writes,
-            [(address, 0) for address in reset_addresses]
-            + [(address, 0xFFFFFFFF) for address in reset_addresses],
-        )
-        self.assertEqual(
-            device.messages,
-            [
-                ((0x33,), {"arg0": 250, "arg1": 0}),
-                ((0xAF,), {}),
-                ((0x20,), {}),
-                ((0x33,), {"arg0": 0, "arg1": 0}),
-            ],
-        )
+        device.get_tensix_locations.assert_not_called()
+        self.assertEqual(device.block_broadcasts, [])
+        self.assertEqual(device.block_reads, [])
+        self.assertEqual(device.axi_writes, [])
+        self.assertEqual(device.messages, [])
 
-    @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
-    @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
-    def test_blackhole_stop_retains_forced_aiclk_after_reset_failure(
-        self,
-        _get_driver_version,
-        _is_driver_version_at_least,
-    ):
-        device = FakeChip()
+    def test_packaged_blackhole_power_virus_uses_only_quiesced_streams(self):
+        ttx_path = Path(__file__).parents[1] / "tt_burnin" / "ttx" / "bhpv.ttx"
+        with zipfile.ZipFile(ttx_path) as ttx:
+            manifest = ttx.read("test.yaml")
 
-        def fail_full_tensix_reset(*args, **kwargs):
-            device.messages.append((args, kwargs))
-            if args == (0xAF,):
-                raise RuntimeError("reset failed")
-            return (0, 0)
-
-        device.arc_msg = fail_full_tensix_reset
-
-        with patch("tt_burnin.main.scrub_burnin_bh"):
-            with self.assertRaisesRegex(RuntimeError, "reset failed"):
-                stop_burnin_bh(device, {CoreId(1, 2)})
-
-        self.assertNotIn(((0x33,), {"arg0": 0, "arg1": 0}), device.messages)
-        self.assertEqual(device.messages[0], ((0x33,), {"arg0": 250, "arg1": 0}))
-
-    @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
-    @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
-    def test_blackhole_stop_rechecks_containment_before_risc_release(
-        self,
-        _get_driver_version,
-        _is_driver_version_at_least,
-    ):
-        device = FakeChip()
-
-        def fail_policy_check():
-            raise RuntimeError("containment tripped")
-
-        with patch("tt_burnin.main.scrub_burnin_bh"):
-            with self.assertRaisesRegex(RuntimeError, "containment tripped"):
-                stop_burnin_bh(
-                    device,
-                    {CoreId(1, 2)},
-                    before_risc_release=fail_policy_check,
-                )
-
-        reset_addresses = [0x80030040 + index * 4 for index in range(8)]
-        self.assertEqual(
-            device.axi_writes,
-            [(address, 0) for address in reset_addresses],
-        )
-        self.assertNotIn(((0x33,), {"arg0": 0, "arg1": 0}), device.messages)
-
-    @patch("tt_burnin.main.read_bin_image_chunks")
-    @patch("tt_burnin.main.TtxFile")
-    @patch("tt_burnin.main.path")
-    def test_blackhole_scrub_erases_every_loaded_image_region(
-        self,
-        resource_path,
-        ttx_file,
-        read_chunks,
-    ):
-        data_path = MagicMock()
-        data_path.joinpath.return_value = "/tmp/bhpv.ttx"
-        resource_path.return_value.__enter__.return_value = data_path
-        ttx = MagicMock()
-        ttx_file.return_value.__enter__.return_value = ttx
-        ttx.open.side_effect = ["image", "ckernels"]
-        read_chunks.side_effect = [
-            [(0x1000, b"image")],
-            [(0x2000, b"kernel")],
+        stream_ids = [
+            int(stream_id)
+            for stream_id in re.findall(rb"(?m)^\s+stream_id:\s*(\d+)\s*$", manifest)
         ]
-        device = FakeChip()
-        cores = {CoreId(1, 2), CoreId(10, 2)}
+        self.assertEqual(stream_ids, [4, 5, 6])
 
-        scrub_burnin_bh(device, cores)
-
-        self.assertEqual(
-            device.block_broadcasts,
-            [
-                (0, 0x1000, bytes(5)),
-                (0, 0x2000, bytes(6)),
-            ],
-        )
-        self.assertEqual(
-            device.block_reads,
-            [
-                (0, 1, 2, 0x1000),
-                (0, 1, 2, 0x1001),
-                (0, 10, 2, 0x1000),
-                (0, 10, 2, 0x1001),
-                (0, 1, 2, 0x2000),
-                (0, 1, 2, 0x2002),
-                (0, 10, 2, 0x2000),
-                (0, 10, 2, 0x2002),
-            ],
-        )
-
-    @patch("tt_burnin.main.read_bin_image_chunks", return_value=[(0x1000, b"image")])
-    @patch("tt_burnin.main.TtxFile")
-    @patch("tt_burnin.main.path")
-    def test_blackhole_scrub_fails_if_a_core_retains_the_image(
+    @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
+    @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
+    def test_blackhole_stop_does_not_depend_on_firmware_reset_commands(
         self,
-        resource_path,
-        ttx_file,
-        _read_chunks,
+        _get_driver_version,
+        _is_driver_version_at_least,
     ):
-        data_path = MagicMock()
-        data_path.joinpath.return_value = "/tmp/bhpv.ttx"
-        resource_path.return_value.__enter__.return_value = data_path
-        ttx_file.return_value.__enter__.return_value = MagicMock()
         device = FakeChip()
 
-        def retain_image(_noc, _x, _y, _address, observed):
-            observed[0] = 1
+        device.arc_msg = MagicMock(
+            side_effect=RuntimeError("firmware rejected message")
+        )
 
-        device.noc_read = retain_image
+        stop_burnin_bh(device, {CoreId(1, 2)})
 
-        with self.assertRaisesRegex(RuntimeError, "Failed to scrub BHPV"):
-            scrub_burnin_bh(device, {CoreId(1, 2)})
+        device.arc_msg.assert_not_called()
+        self.assertEqual(device.axi_writes, [])
+
+    @patch("tt_burnin.main.is_driver_version_at_least", return_value=True)
+    @patch("tt_burnin.main.get_driver_version", return_value="2.11.0")
+    def test_blackhole_stop_reasserts_soft_reset_after_a_quiesce_write_fails(
+        self,
+        _get_driver_version,
+        _is_driver_version_at_least,
+    ):
+        device = FakeChip()
+        real_broadcast = device.noc_broadcast32
+
+        def fail_one_stream_write(*args):
+            real_broadcast(*args)
+            if args == (1, 0xFFB40000 + 4 * 0x1000 + 8, 0):
+                raise RuntimeError("NOC1 stream write failed")
+
+        device.noc_broadcast32 = fail_one_stream_write
+
+        with self.assertRaisesRegex(RuntimeError, "NOC1 stream write failed"):
+            stop_burnin_bh(device, {CoreId(1, 2)})
+
+        self.assertEqual(device.block_broadcasts, [])
+        self.assertEqual(device.block_reads, [])
+        self.assertEqual(device.axi_writes, [])
+        self.assertEqual(device.messages, [])
+        self.assertEqual(
+            device.broadcasts[-2:],
+            [(1, 0xFFB121B0, 0x7FFFF), (0, 0xFFB121B0, 0x7FFFF)],
+        )
 
 
 if __name__ == "__main__":

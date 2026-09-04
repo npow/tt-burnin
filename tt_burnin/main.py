@@ -17,7 +17,7 @@ from rich.text import Text
 from rich.console import Group
 from importlib.resources import path
 from tt_burnin.chip import WhChip, RemoteWhChip, BhChip
-from tt_burnin.load_ttx import load_ttx_file, read_bin_image_chunks, TtxFile, CoreId
+from tt_burnin.load_ttx import load_ttx_file, TtxFile, CoreId
 from tt_burnin.ramp import (
     BoardPowerLimitExceeded,
     check_power_limits,
@@ -247,105 +247,95 @@ def start_burnin_bh(
     return set(selected_cores)
 
 
-def scrub_burnin_bh(device, loaded_cores):
-    """Erase and verify the packaged BHPV image while all RISCs are reset."""
-    with path("tt_burnin", "") as data_path:
-        with TtxFile(str(data_path.joinpath("ttx/bhpv.ttx"))) as ttx:
-            for image_name in ("0-0/image.bin", "0-0/ckernels.bin"):
-                for address, data in read_bin_image_chunks(ttx.open(image_name)):
-                    cleared = bytes(len(data))
-                    device.noc_broadcast(0, address, cleared)
-                    for core in sorted(loaded_cores):
-                        # Check both ends of every cleared region on every
-                        # functional core. A zeroed entry point prevents the
-                        # retained image from executing; checking the tail also
-                        # catches truncated broadcast writes.
-                        for offset in (0, len(data) - 4):
-                            observed = bytearray(4)
-                            device.noc_read(0, *core, address + offset, observed)
-                            if observed != bytes(4):
-                                raise RuntimeError(
-                                    f"Failed to scrub BHPV from core {core} "
-                                    f"at 0x{address + offset:x}"
-                                )
+def stop_burnin_bh(device, loaded_cores=None):
+    """Cooperatively stop BHPV without resetting Tensix tiles or firmware.
 
+    The packaged workload uses streams 4, 5, and 6.  Hold every compute block
+    in soft reset, reset those autonomous streams over both NOC rings, and
+    leave soft reset asserted.  The retained L1 image cannot execute in that
+    state; a later workload must overwrite its selected cores before releasing
+    them.  Avoiding L1 erase and verification is intentional: reads from a
+    stalled endpoint can cause a PCIe Completion Timeout, and broad block writes
+    add NOC traffic without strengthening the asserted-reset boundary.
 
-def stop_burnin_bh(device, loaded_cores=None, before_risc_release=None):
-    """Stop BHPV and clear all state that could restart the workload.
-
-    Merely asserting the per-RISC soft-reset register is insufficient for an
-    infinite-loop power virus: stream and math-engine state lives outside the
-    RISC cores and can survive a later power-state transition.  Follow the
-    full-Tensix reset sequence used by the Blackhole firmware end-to-end reset
-    test so opening the device again cannot resume the old workload.
+    ``loaded_cores`` is retained for API compatibility.  The stop operation is
+    a broadcast because startup first resets every functional Tensix and can be
+    interrupted before its selected-core set is returned.
     """
-    TT_SMC_MSG_REINIT_TENSIX = 0x20
-    TT_SMC_MSG_FORCE_AICLK = 0x33
-    TT_SMC_MSG_TOGGLE_TENSIX_RESET = 0xAF
-    TENSIX_RISC_RESET_ADDRS = tuple(0x80030040 + index * 4 for index in range(8))
+    del loaded_cores
     SOFT_RESET_ADDR = 0xFFB121B0
-    SOFT_RESET_DATA = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 18)
+    ALL_COMPUTE_SOFT_RESET_DATA = 0x7FFFF
+    STREAM_REG_SPACE = 0x1000
+    BHPV_STREAM_IDS = (4, 5, 6)
+    STREAM_ONETIME_MISC_CFG_OFFSET = 2 * 4
+    STREAM_RESET_OFFSET = 271 * 4
+    STREAM_OVERLAY_BASE = 0xFFB40000
 
-    def checked_arc_msg(message, operation, **kwargs):
-        response = device.arc_msg(message, **kwargs)
-        if len(response) < 2 or response[1] != 0:
-            raise RuntimeError(f"Blackhole firmware failed to {operation}: {response}")
-        return response
+    def host_quiesce_tensix_streams():
+        errors = []
 
-    # We only send GO_BUSY/GO_IDLE on BH if kmd < 2.6.0
+        def attempt(description, operation):
+            try:
+                operation()
+            except Exception as error:
+                errors.append(f"{description}: {error}")
+
+        # NOC1 runs in the opposite direction around the mesh. Try it first so
+        # a backpressured NOC0 cannot prevent the initial stop, then repeat on
+        # NOC0. Every later operation is best-effort even if one write fails.
+        for noc in (1, 0):
+            attempt(
+                f"assert all-compute soft reset on NOC{noc}",
+                lambda noc=noc: device.noc_broadcast32(
+                    noc, SOFT_RESET_ADDR, ALL_COMPUTE_SOFT_RESET_DATA
+                ),
+            )
+        time.sleep(0.01)
+
+        for noc in (1, 0):
+            for stream_id in BHPV_STREAM_IDS:
+                stream_base = STREAM_OVERLAY_BASE + stream_id * STREAM_REG_SPACE
+                attempt(
+                    f"disable BHPV stream {stream_id} on NOC{noc}",
+                    lambda noc=noc, stream_base=stream_base: device.noc_broadcast32(
+                        noc,
+                        stream_base + STREAM_ONETIME_MISC_CFG_OFFSET,
+                        0,
+                    ),
+                )
+                attempt(
+                    f"reset BHPV stream {stream_id} on NOC{noc}",
+                    lambda noc=noc, stream_base=stream_base: device.noc_broadcast32(
+                        noc,
+                        stream_base + STREAM_RESET_OFFSET,
+                        1,
+                    ),
+                )
+
+        # Seal the final state after the stream writes. In particular, a failed
+        # stream transaction cannot skip these last reset attempts.
+        for noc in (1, 0):
+            attempt(
+                f"reassert all-compute soft reset on NOC{noc}",
+                lambda noc=noc: device.noc_broadcast32(
+                    noc, SOFT_RESET_ADDR, ALL_COMPUTE_SOFT_RESET_DATA
+                ),
+            )
+        time.sleep(0.01)
+
+        if errors:
+            raise RuntimeError("Failed to quiesce BHPV: " + "; ".join(errors))
+
+    # Stop execution without discovery, readback, or firmware interaction.
+    # The sequence contains no 0xAF/0x20 hard-reset messages, AICLK force, or
+    # writes to the ASIC-level Tensix RISC reset registers.
+    host_quiesce_tensix_streams()
+
+    # Only unsupported pre-2.6 KMDs need the legacy power-manager idle message.
+    # Send it last so a firmware error cannot prevent the cooperative stop.
     driver = get_driver_version()
     if not is_driver_version_at_least(driver, "2.6.0"):
         device.arc_msg(0x54)
-
-    # Always scrub every functional core, including cores carrying an image
-    # left by an earlier interrupted run. The current run's set is retained for
-    # defensive compatibility with callers whose location list changes.
-    scrub_cores = {CoreId(*core) for core in device.get_tensix_locations()}
-    if loaded_cores is not None:
-        scrub_cores.update(loaded_cores)
-
-    # This sequence mirrors tensix_reset_sequence() in the Blackhole firmware
-    # e2e tests. Keep AICLK at the firmware-qualified reset frequency while the
-    # tile and NOC state are rebuilt. If any cleanup step fails, intentionally
-    # retain that safe force instead of allowing a retained workload to run at
-    # the prior clock.
-    checked_arc_msg(
-        TT_SMC_MSG_FORCE_AICLK,
-        "force the reset-safe AICLK",
-        arg0=250,
-        arg1=0,
-    )
-
-    # Stop every RISC from the reset unit before issuing any Tensix multicast.
-    # A live multicast reset while BHPV is saturating the NOC can wedge the
-    # management path itself, preventing both cleanup and an ARC-coordinated
-    # reset. These active-low registers are local to the reset unit and do not
-    # depend on a transaction reaching every busy tile.
-    for address in TENSIX_RISC_RESET_ADDRS:
-        device.axi_write32(address, 0)
-
-    checked_arc_msg(TT_SMC_MSG_TOGGLE_TENSIX_RESET, "reset the Tensix tiles")
-    checked_arc_msg(TT_SMC_MSG_REINIT_TENSIX, "reinitialize the Tensix tiles")
-
-    # The tile reset clears this register. Reassert every RISC's soft reset
-    # before touching L1 or releasing the ASIC-level RISC reset signals.
-    device.noc_broadcast32(1, SOFT_RESET_ADDR, SOFT_RESET_DATA)
-
-    # A complete tile reset clears engine state but preserves Tensix L1 SRAM.
-    # Erase the retained image after reset/reinit, verify the erase, and only
-    # then allow the ASIC-level RISC reset signals to be released.
-    scrub_burnin_bh(device, scrub_cores)
-    if before_risc_release is not None:
-        before_risc_release()
-    for address in TENSIX_RISC_RESET_ADDRS:
-        device.axi_write32(address, 0xFFFFFFFF)
-
-    checked_arc_msg(
-        TT_SMC_MSG_FORCE_AICLK,
-        "release the reset-safe AICLK",
-        arg0=0,
-        arg1=0,
-    )
 
 
 def positive_int(value):
@@ -1126,13 +1116,7 @@ def main():
             if isinstance(device, WhChip):
                 stop_burnin_wh(device)
             elif isinstance(device, BhChip):
-                stop_burnin_bh(
-                    device,
-                    loaded_bh_cores.get(id(device)),
-                    before_risc_release=lambda: check_runtime_power_status(
-                        telemetry_devices
-                    ),
-                )
+                stop_burnin_bh(device, loaded_bh_cores.get(id(device)))
             else:
                 raise NotImplementedError(f"Don't support {device}")
 
