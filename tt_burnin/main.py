@@ -528,7 +528,12 @@ def detect_and_group_devices():
 
 def set_device_power_state(device, state):
     try:
-        device.set_power_state(state)
+        if state == "low" and device.as_bh() is not None:
+            device.set_power(
+                aiclk=False, mrisc=True, tensix=True, l2cpu=True, pcie=True
+            )
+        else:
+            device.set_power_state(state)
     except Exception as error:
         raise RuntimeError(
             f"Failed to set device power state to {state}. Firmware v18.12.0 "
@@ -540,13 +545,11 @@ def set_burnin_power_state(device, mrisc=False, l2cpu=False):
     """Enable only the power domains required by the burnin workload."""
     try:
         if device.as_bh() is not None:
-            # BHPV runs entirely on Tensix using local L1/NOC traffic. Waking
-            # GDDR/MRISC adds a board-power step without helping the workload.
-            # L2CPU remains enabled because it hosts PCIe/management services;
-            # runtime firmware deliberately rejects attempts to gate it.
+            # Runtime firmware retains these dependencies until a quiesce
+            # handshake can prove that all NoC/GDDR traffic has drained.
             device.set_power(
                 aiclk=True,
-                mrisc=mrisc,
+                mrisc=True,
                 tensix=True,
                 l2cpu=True,
                 pcie=True,

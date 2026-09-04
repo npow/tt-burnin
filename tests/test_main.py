@@ -16,6 +16,7 @@ from tt_burnin.main import (
     parse_args,
     set_board_power_limit,
     set_burnin_power_state,
+    set_device_power_state,
     set_host_aiclk_limit,
     set_tdp_limit,
     preflight_run_support,
@@ -129,7 +130,7 @@ class MainTests(unittest.TestCase):
             device.power,
             {
                 "aiclk": True,
-                "mrisc": False,
+                "mrisc": True,
                 "tensix": True,
                 "l2cpu": True,
                 "pcie": True,
@@ -140,8 +141,16 @@ class MainTests(unittest.TestCase):
         self.assertEqual(device.power["l2cpu"], True)
 
         set_burnin_power_state(device, mrisc=False, l2cpu=False)
-        self.assertEqual(device.power["mrisc"], False)
+        self.assertEqual(device.power["mrisc"], True)
         self.assertEqual(device.power["l2cpu"], True)
+
+    def test_blackhole_idle_retains_domains_without_quiesce_handshake(self):
+        device = FakeRawBlackhole()
+        set_device_power_state(device, "low")
+        self.assertEqual(
+            device.power,
+            dict(aiclk=False, mrisc=True, tensix=True, l2cpu=True, pcie=True),
+        )
 
     def test_host_aiclk_limit_is_set_and_restored(self):
         device = FakeRawBlackhole()
